@@ -205,6 +205,7 @@ def _export_onnx(
 
     tmp_dir = os.path.abspath("onnx_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, "model.onnx")
     # Ensure all model parameters and buffers are placed on the input device
     target_device = inputs[0].device if len(inputs) > 0 else torch.device("cuda")
     try:

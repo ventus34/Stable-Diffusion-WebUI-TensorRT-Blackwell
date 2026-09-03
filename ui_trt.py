@@ -10,7 +10,7 @@ import gradio as gr
 
 from modules.shared import cmd_opts
 from modules.ui_components import FormRow
-from modules import sd_hijack, sd_models, shared
+from modules import sd_hijack, sd_models, shared, devices
 from modules.ui_common import refresh_symbol
 from modules.ui_components import ToolButton
 
@@ -132,14 +132,15 @@ def export_unet_to_trt(
             pass
 
         try:
+            target_device = devices.device if hasattr(devices, "device") else torch.device("cuda")
             if hasattr(shared, "sd_model") and shared.sd_model is not None:
-                shared.sd_model.model.diffusion_model.to(devices.device)
+                shared.sd_model.model.diffusion_model.to(target_device)
                 for param in shared.sd_model.model.diffusion_model.parameters():
-                    if param.device != devices.device:
-                        param.data = param.data.to(devices.device)
+                    if param.device != target_device:
+                        param.data = param.data.to(target_device)
                 for buf in shared.sd_model.model.diffusion_model.buffers():
-                    if buf.device != devices.device:
-                        buf.data = buf.data.to(devices.device)
+                    if buf.device != target_device:
+                        buf.data = buf.data.to(target_device)
         except Exception as e:
             print(f"[TensorRT] Info: synchronizacja wag na GPU: {e}", flush=True)
 
