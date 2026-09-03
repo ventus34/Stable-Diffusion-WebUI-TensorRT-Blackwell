@@ -60,103 +60,146 @@ def export_unet_to_trt(
     force_export,
     static_shapes,
     preset,
+    progress=gr.Progress(track_tqdm=True),
 ):
-    sd_hijack.model_hijack.apply_optimizations("None")
+    try:
+        sd_hijack.model_hijack.apply_optimizations("None")
 
-    is_xl = shared.sd_model.is_sdxl
-    model_name = shared.sd_model.sd_checkpoint_info.model_name
+        is_xl = shared.sd_model.is_sdxl
+        model_name = shared.sd_model.sd_checkpoint_info.model_name
 
-    profile_settings = ProfileSettings(
-        batch_min,
-        batch_opt,
-        batch_max,
-        height_min,
-        height_opt,
-        height_max,
-        width_min,
-        width_opt,
-        width_max,
-        token_count_min,
-        token_count_opt,
-        token_count_max,
-    )
-    if preset == "Default":
-        profile_settings = profile_presets.get_default(is_xl=is_xl)
-    use_fp32 = is_fp32()
-
-    print(f"Exporting {model_name} to TensorRT using - {profile_settings}")
-    profile_settings.token_to_dim(static_shapes)
-
-    model_hash = shared.sd_model.sd_checkpoint_info.hash
-    model_name = shared.sd_model.sd_checkpoint_info.model_name
-
-    onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name)
-    timing_cache = modelmanager.get_timing_cache()
-
-    diable_optimizations = is_xl
-    embedding_dim = get_context_dim()
-
-    modelobj = UNetModel(
-        shared.sd_model.model.diffusion_model,
-        embedding_dim,
-        text_minlen=profile_settings.t_min,
-        is_xl=is_xl,
-    )
-    modelobj.apply_torch_model()
-
-    profile = modelobj.get_input_profile(profile_settings)
-    export_onnx(
-        onnx_path,
-        modelobj,
-        profile_settings,
-        diable_optimizations=diable_optimizations,
-    )
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    trt_engine_filename, trt_path = modelmanager.get_trt_path(
-        model_name, model_hash, profile, static_shapes
-    )
-
-    if not os.path.exists(trt_path) or force_export:
-        print(
-            "Building TensorRT engine... This can take a while, please check the progress in the terminal."
+        profile_settings = ProfileSettings(
+            batch_min,
+            batch_opt,
+            batch_max,
+            height_min,
+            height_opt,
+            height_max,
+            width_min,
+            width_opt,
+            width_max,
+            token_count_min,
+            token_count_opt,
+            token_count_max,
         )
-        gr.Info(
-            "Building TensorRT engine... This can take a while, please check the progress in the terminal."
+        if preset == "Default":
+            profile_settings = profile_presets.get_default(is_xl=is_xl)
+        use_fp32 = is_fp32()
+
+        print(f"\n========================================================", flush=True)
+        print(f"[TensorRT] ROZPOCZĘCIE EKSPORTU SILNIKA", flush=True)
+        print(f"[TensorRT] Model: {model_name} ({'SDXL' if is_xl else 'SD 1.5/2.1'})", flush=True)
+        print(f"[TensorRT] Ustawienia profilu: {profile_settings}", flush=True)
+        print(f"[TensorRT] Precyzja: {'FP32' if use_fp32 else 'FP16'}", flush=True)
+        print(f"========================================================\n", flush=True)
+
+        yield (
+            f"### ⏳ [Krok 1/3] Przygotowywanie modelu do eksportu...\n"
+            f"- **Model:** `{model_name}`\n"
+            f"- **Profil:** `{profile_settings.w_opt}x{profile_settings.h_opt}` (batch: {profile_settings.bs_opt})\n"
+            f"*Szczegółowe postępy są na bieżąco wypisywane w konsoli/terminalu.*"
         )
-        ret = export_trt(
-            trt_path,
+
+        profile_settings.token_to_dim(static_shapes)
+
+        model_hash = shared.sd_model.sd_checkpoint_info.hash
+        model_name = shared.sd_model.sd_checkpoint_info.model_name
+
+        onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name)
+        timing_cache = modelmanager.get_timing_cache()
+
+        diable_optimizations = is_xl
+        embedding_dim = get_context_dim()
+
+        modelobj = UNetModel(
+            shared.sd_model.model.diffusion_model,
+            embedding_dim,
+            text_minlen=profile_settings.t_min,
+            is_xl=is_xl,
+        )
+        modelobj.apply_torch_model()
+
+        profile = modelobj.get_input_profile(profile_settings)
+
+        if not os.path.exists(onnx_path):
+            yield (
+                f"### ⏳ [Krok 1/3] Trwa eksportowanie modelu do formatu ONNX...\n"
+                f"- Plik: `{onnx_path}`\n"
+                f"*Dla modeli SDXL tracing i serializacja zajmuje zwykle 1–3 minuty. Proszę nie odświeżać strony.*"
+            )
+
+        export_onnx(
             onnx_path,
-            timing_cache,
-            profile=profile,
-            use_fp16=not use_fp32,
+            modelobj,
+            profile_settings,
+            diable_optimizations=diable_optimizations,
         )
-        if ret:
-            return "## Export Failed due to unknown reason. See shell for more information. \n"
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        print("TensorRT engines has been saved to disk.")
-        modelmanager.add_entry(
-            model_name,
-            model_hash,
-            profile,
-            static_shapes,
-            fp32=use_fp32,
-            inpaint=True if modelobj.in_channels == 6 else False,
-            refit=True,
-            vram=0,
-            unet_hidden_dim=modelobj.in_channels,
-            lora=False,
-        )
-    else:
-        print(
-            "TensorRT engine found. Skipping build. You can enable Force Export in the Advanced Settings to force a rebuild if needed."
+        trt_engine_filename, trt_path = modelmanager.get_trt_path(
+            model_name, model_hash, profile, static_shapes
         )
 
-    gc.collect()
-    torch.cuda.empty_cache()
+        if not os.path.exists(trt_path) or force_export:
+            yield (
+                f"### ⚙️ [Krok 2/3] Trwa kompilacja silnika TensorRT dla RTX 5070 Ti (sm_120)...\n"
+                f"- **Plik docelowy:** `{trt_engine_filename}`\n"
+                f"- **Status:** TensorRT profiluje taktyki obliczeniowe dla Twojego GPU.\n"
+                f"*Ten etap zajmuje 2–6 minut. Podgląd faz widoczny w konsoli.*"
+            )
 
-    return "## Exported Successfully \n"
+            ret = export_trt(
+                trt_path,
+                onnx_path,
+                timing_cache,
+                profile=profile,
+                use_fp16=not use_fp32,
+            )
+            if ret:
+                yield (
+                    f"### ❌ Kompilacja silnika TensorRT zakończyła się niepowodzeniem (kod błędu {ret}).\n"
+                    f"*Szczegółowy komunikat błędu oraz traceback zostały wypisane w konsoli terminala.*"
+                )
+                return
+
+            print(f"[TensorRT] Dodawanie wpisu silnika do model.json...", flush=True)
+            modelmanager.add_entry(
+                model_name,
+                model_hash,
+                profile,
+                static_shapes,
+                fp32=use_fp32,
+                inpaint=True if modelobj.in_channels == 6 else False,
+                refit=True,
+                vram=0,
+                unet_hidden_dim=modelobj.in_channels,
+                lora=False,
+            )
+        else:
+            print(
+                f"[TensorRT] Silnik TensorRT już istnieje: {trt_path}. Pomijanie kompilacji.", flush=True
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        yield (
+            f"### ✅ [Krok 3/3] Silnik TensorRT został pomyślnie skompilowany i zapisany!\n\n"
+            f"- **Plik silnika:** `{trt_engine_filename}`\n"
+            f"- **Rozdzielczość:** `{profile_settings.w_opt}x{profile_settings.h_opt}`\n"
+            f"- **Batch:** `{profile_settings.bs_opt}`\n\n"
+            f"**Jak używać:** Wybierz profil w `sd_unet` (lub ustaw na `Automatic`) i generuj obrazy w `txt2img`."
+        )
+
+    except Exception as e:
+        print(f"\n[TensorRT BŁĄD PODCZAS EKSPORTU]: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        yield (
+            f"### ❌ Wystąpił błąd podczas eksportu: `{e}`\n\n"
+            f"Szczegółowy traceback znajduje się w oknie terminala/konsoli WebUI."
+        )
 
 
 def export_lora_to_trt(lora_name, force_export):
