@@ -1,16 +1,18 @@
 # TensorRT Extension for Stable Diffusion (Blackwell & RTX 50-Series Edition)
 
-This is a modernized fork of NVIDIA's TensorRT extension for Stable Diffusion WebUI (Automatic1111 / reForge / SD.Next), updated for **NVIDIA Blackwell GPUs (GeForce RTX 5070 Ti, RTX 5080, RTX 5090)** with **Compute Capability 12.0 (`sm_120`)** and **TensorRT 10.8+**.
+This is a modernized fork of NVIDIA's TensorRT extension for Stable Diffusion WebUI (**tested and verified with [stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge)** and Automatic1111 / SD.Next), updated for **NVIDIA Blackwell GPUs (GeForce RTX 5070 Ti, RTX 5080, RTX 5090)** with **Compute Capability 12.0 (`sm_120`)** and **TensorRT 10.8+**.
 
 Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 
 ---
 
 ## Key Improvements in this Edition
-- **Blackwell (RTX 50-series) Support**: Full support for `sm_120` (cc120) compute capability.
+- **Tested with reForge**: Fully tested and verified with `stable-diffusion-webui-reForge`. Includes automated GPU weight synchronization for `ldm_patched` offloading and forced `dynamo=False` TorchScript export to prevent `FakeTensor` device mismatches on newer PyTorch versions.
+- **Blackwell (RTX 50-series) Support**: Full support for `sm_120` (cc120) compute capability (RTX 5070 Ti, 5080, 5090).
 - **TensorRT 10.8+ I/O Tensor API**: Replaced deprecated/removed legacy bindings API with modern TensorRT 10 I/O Tensor runtime.
 - **Dynamic Timing Cache**: Automatically generates and saves new tactic caches for Blackwell (`timing_cache_*_cc120.cache`).
-- **Python 3.10 – 3.12 Compatible**: Removed obsolete `protobuf==3.20.2` and ancient `tensorrt==9.0.1.post11.dev4` / CUDA 11 pins.
+- **Python 3.10 – 3.12 Compatible**: Removed obsolete `protobuf==3.20.2` and ancient `tensorrt==9.0.1.post11.dev4` / CUDA 11 pins. Includes compatibility patch for newer `onnx >= 1.17` (`float32_to_bfloat16`).
+- **No Browser Timeouts**: Streaming generator with live progress reporting keeps WebUI connections alive during long ONNX and TensorRT export jobs.
 - **Robust Buffer Allocation**: Two-pass I/O tensor shape setting prevents race conditions and eliminates unnecessary GPU reallocations per denoising step.
 - **Safe Headless/CPU Mode**: Extension imports gracefully even when running without an active GPU or in headless environments.
 
@@ -29,8 +31,8 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 
 ## Installation
 
-### Automatic Installation (WebUI)
-1. Start your Stable Diffusion WebUI.
+### Automatic Installation (WebUI / reForge)
+1. Start your Stable Diffusion WebUI or reForge.
 2. Go to the **Extensions** tab -> **Install from URL**.
 3. Paste the URL:
    ```
@@ -40,10 +42,10 @@ Supports Stable Diffusion 1.5, 2.1, SDXL, SDXL Turbo, and LCM.
 5. Restart the WebUI completely. During startup, `install.py` will verify or install the necessary TensorRT 10.8+ packages.
 
 ### Manual / Pre-installation
-If you wish to install dependencies in your WebUI venv ahead of time:
+If you wish to install dependencies in your WebUI / reForge venv ahead of time:
 ```bash
-# In your WebUI python environment:
-pip install "tensorrt>=10.8.0" polygraphy onnx-graphsurgeon onnx optimum --extra-index-url https://pypi.nvidia.com
+# In your WebUI / reForge python environment:
+pip install "tensorrt>=10.8.0" polygraphy onnx-graphsurgeon onnx onnxscript optimum --extra-index-url https://pypi.nvidia.com
 ```
 
 ---
