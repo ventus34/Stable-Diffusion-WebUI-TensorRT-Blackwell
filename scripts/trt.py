@@ -2,6 +2,29 @@ import os
 import re
 from typing import List
 
+# Compatibility patch for newer onnx versions (>= 1.17) where float32_to_bfloat16 was removed from onnx.helper
+try:
+    import onnx
+    import onnx.helper
+    import struct
+
+    if not hasattr(onnx.helper, "float32_to_bfloat16"):
+        def _float32_to_bfloat16(fval: float, truncate: bool = False) -> int:
+            ival = int.from_bytes(struct.pack("<f", float(fval)), "little")
+            if truncate:
+                return ival >> 16
+            return (ival + 0x8000 + ((ival >> 16) & 1)) >> 16
+
+        onnx.helper.float32_to_bfloat16 = _float32_to_bfloat16
+
+    if not hasattr(onnx.helper, "bfloat16_to_float32"):
+        def _bfloat16_to_float32(ival: int) -> float:
+            return struct.unpack("<f", (int(ival) << 16).to_bytes(4, "little"))[0]
+
+        onnx.helper.bfloat16_to_float32 = _bfloat16_to_float32
+except Exception:
+    pass
+
 import numpy as np
 import torch
 from torch.cuda import nvtx
