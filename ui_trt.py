@@ -111,6 +111,38 @@ def export_unet_to_trt(
         diable_optimizations = is_xl
         embedding_dim = get_context_dim()
 
+        # reForge / Forge / ComfyUI model loader: ensure all weights are loaded on GPU before tracing
+        try:
+            import ldm_patched.modules.model_management as model_management
+            if hasattr(shared, "sd_model") and shared.sd_model is not None:
+                model_management.load_models_gpu([shared.sd_model])
+        except Exception:
+            pass
+
+        try:
+            if (
+                hasattr(shared, "sd_model")
+                and shared.sd_model is not None
+                and hasattr(shared.sd_model, "forge_objects")
+            ):
+                unet_patcher = shared.sd_model.forge_objects.get("unet", None)
+                if unet_patcher and hasattr(unet_patcher, "load"):
+                    unet_patcher.load()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(shared, "sd_model") and shared.sd_model is not None:
+                shared.sd_model.model.diffusion_model.to(devices.device)
+                for param in shared.sd_model.model.diffusion_model.parameters():
+                    if param.device != devices.device:
+                        param.data = param.data.to(devices.device)
+                for buf in shared.sd_model.model.diffusion_model.buffers():
+                    if buf.device != devices.device:
+                        buf.data = buf.data.to(devices.device)
+        except Exception as e:
+            print(f"[TensorRT] Info: synchronizacja wag na GPU: {e}", flush=True)
+
         modelobj = UNetModel(
             shared.sd_model.model.diffusion_model,
             embedding_dim,

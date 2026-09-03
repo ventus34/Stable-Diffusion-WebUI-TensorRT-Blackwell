@@ -205,7 +205,34 @@ def _export_onnx(
 
     tmp_dir = os.path.abspath("onnx_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
-    tmp_path = os.path.join(tmp_dir, "model.onnx")
+    # Ensure all model parameters and buffers are placed on the input device
+    target_device = inputs[0].device if len(inputs) > 0 else torch.device("cuda")
+    try:
+        model = model.to(target_device)
+        for p in model.parameters():
+            if p.device != target_device:
+                p.data = p.data.to(target_device)
+        for b in model.buffers():
+            if b.device != target_device:
+                b.data = b.data.to(target_device)
+    except Exception as e:
+        print(f"[TensorRT] Info: Weryfikacja urządzeń parametrów modelu: {e}", flush=True)
+
+    export_kwargs = {
+        "export_params": True,
+        "opset_version": max(opset, 17),
+        "do_constant_folding": True,
+        "input_names": in_names,
+        "output_names": out_names,
+        "dynamic_axes": dyn_axes,
+    }
+
+    # In PyTorch >= 2.2 / 2.4, explicitly set dynamo=False to use TorchScript tracer instead of TorchDynamo/FakeTensor
+    import inspect
+    sig = inspect.signature(torch.onnx.export)
+    if "dynamo" in sig.parameters:
+        export_kwargs["dynamo"] = False
+
     try:
         print(f"[TensorRT] Eksportowanie grafu PyTorch do ONNX (plik roboczy: {tmp_path})...", flush=True)
         print(f"[TensorRT] To może potrwać 1–3 minuty. Proszę czekać...", flush=True)
@@ -214,12 +241,7 @@ def _export_onnx(
                 model,
                 inputs,
                 tmp_path,
-                export_params=True,
-                opset_version=opset,
-                do_constant_folding=True,
-                input_names=in_names,
-                output_names=out_names,
-                dynamic_axes=dyn_axes,
+                **export_kwargs,
             )
         print(f"[TensorRT] Graf ONNX wyeksportowany pomyślnie!", flush=True)
     except Exception as e:
