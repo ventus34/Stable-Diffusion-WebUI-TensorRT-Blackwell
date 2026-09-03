@@ -158,16 +158,20 @@ class Engine:
         self.cuda_graph_instance = None  # cuda graph
 
     def __del__(self):
-        del self.engine
-        del self.context
-        del self.buffers
-        del self.tensors
+        for attr in ("context", "engine", "buffers", "tensors"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
 
     def reset(self, engine_path=None):
-        del self.engine
-        del self.context
-        del self.buffers
-        del self.tensors
+        for attr in ("context", "engine", "buffers", "tensors"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
         self.engine_path = engine_path
 
         self.buffers = OrderedDict()
@@ -400,20 +404,39 @@ class Engine:
         return self.tensors
 
     def __str__(self):
-        out = ""
-        for opt_profile in range(self.engine.num_optimization_profiles):
-            out += f"Profile {opt_profile}:\n"
-            if hasattr(self.engine, "num_io_tensors"):
-                for binding in range(self.engine.num_io_tensors):
-                    name = self.engine.get_tensor_name(binding)
-                    if hasattr(self.engine, "get_tensor_profile_shape"):
-                        shape = self.engine.get_tensor_profile_shape(name, opt_profile)
-                    else:
-                        shape = self.engine.get_profile_shape(opt_profile, name)
-                    out += f"\t{name} = {shape}\n"
-            elif hasattr(self.engine, "num_bindings"):
-                for binding_idx in range(self.engine.num_bindings):
-                    name = self.engine.get_binding_name(binding_idx)
-                    shape = self.engine.get_profile_shape(opt_profile, name)
-                    out += f"\t{name} = {shape}\n"
-        return out
+        try:
+            out = ""
+            for opt_profile in range(self.engine.num_optimization_profiles):
+                out += f"Profile {opt_profile}:\n"
+                if hasattr(self.engine, "num_io_tensors"):
+                    for binding in range(self.engine.num_io_tensors):
+                        name = self.engine.get_tensor_name(binding)
+                        shape = "unknown"
+                        try:
+                            is_input = (
+                                hasattr(self.engine, "get_tensor_mode")
+                                and self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+                            )
+                            if is_input and hasattr(self.engine, "get_tensor_profile_shape"):
+                                shape = self.engine.get_tensor_profile_shape(name, opt_profile)
+                            elif hasattr(self.engine, "get_tensor_shape"):
+                                shape = self.engine.get_tensor_shape(name)
+                            elif hasattr(self.engine, "get_profile_shape"):
+                                shape = self.engine.get_profile_shape(opt_profile, name)
+                        except Exception:
+                            try:
+                                shape = self.engine.get_tensor_shape(name)
+                            except Exception:
+                                pass
+                        out += f"\t{name} = {shape}\n"
+                elif hasattr(self.engine, "num_bindings"):
+                    for binding_idx in range(self.engine.num_bindings):
+                        name = self.engine.get_binding_name(binding_idx)
+                        try:
+                            shape = self.engine.get_profile_shape(opt_profile, name)
+                        except Exception:
+                            shape = "unknown"
+                        out += f"\t{name} = {shape}\n"
+            return out
+        except Exception:
+            return f"TensorRT Engine ({self.engine_path})"

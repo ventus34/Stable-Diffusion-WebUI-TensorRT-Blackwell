@@ -130,8 +130,11 @@ class TrtUnet(sd_unet.SdUnet):
                 os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
             )
         self.engine.load()
-        print(f"\nLoaded Profile: {self.profile_idx}")
-        print(self.engine)
+        try:
+            print(f"\nLoaded Profile: {self.profile_idx}")
+            print(self.engine)
+        except Exception:
+            pass
         self.engine_vram_req = getattr(
             self.engine.engine,
             "device_memory_size_v2",
