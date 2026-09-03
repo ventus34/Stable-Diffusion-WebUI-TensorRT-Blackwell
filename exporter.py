@@ -191,6 +191,18 @@ def export_onnx(
 def _export_onnx(
     model: torch.nn.Module, inputs: Tuple[torch.Tensor], path: str, opset: int, in_names: List[str], out_names: List[str], dyn_axes: dict, optimizer=None
 ):
+    try:
+        import onnxscript
+    except ImportError:
+        try:
+            print("[TensorRT] Wykryto brak pakietu 'onnxscript' wymaganego przez nowsze wersje PyTorch. Instalowanie w tle...", flush=True)
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxscript"])
+            import onnxscript
+            print("[TensorRT] Pakiet 'onnxscript' został pomyślnie zainstalowany!", flush=True)
+        except Exception as err:
+            print(f"[TensorRT] Uwaga: Automatyczna instalacja onnxscript nie powiodła się: {err}", flush=True)
+
     tmp_dir = os.path.abspath("onnx_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_path = os.path.join(tmp_dir, "model.onnx")

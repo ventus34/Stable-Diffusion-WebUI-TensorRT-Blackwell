@@ -139,6 +139,15 @@ def install():
             live=True,
         )
 
+    # onnxscript (required by PyTorch torch.onnx.export in PyTorch >= 2.2)
+    if not launch.is_installed("onnxscript"):
+        print("[TensorRT Extension] Installing onnxscript...")
+        launch.run_pip(
+            "install onnxscript",
+            "onnxscript",
+            live=True,
+        )
+
 
 if __name__ == "__main__" or "launch" in sys.modules:
     install()
