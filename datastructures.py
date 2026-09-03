@@ -205,6 +205,12 @@ class ProfilePrests:
             "1024x1024 | Batch Size 1 (Static)": ProfileSettings(
                 1, 1, 1, 1024, 1024, 1024, 1024, 1024, 1024, 75, 75, 75
             ),
+            "1024x1536 | Batch Size 1 (Static)": ProfileSettings(
+                1, 1, 1, 1536, 1536, 1536, 1024, 1024, 1024, 75, 75, 75
+            ),
+            "1536x1024 | Batch Size 1 (Static)": ProfileSettings(
+                1, 1, 1, 1024, 1024, 1024, 1536, 1536, 1536, 75, 75, 75
+            ),
             "256x256 - 512x512 | Batch Size 1-4": ProfileSettings(
                 1, 1, 4, 256, 512, 512, 256, 512, 512, 75, 75, 150
             ),
@@ -213,6 +219,9 @@ class ProfilePrests:
             ),
             "768x768 - 1024x1024 | Batch Size 1-4": ProfileSettings(
                 1, 1, 4, 768, 1024, 1024, 768, 1024, 1024, 75, 75, 150
+            ),
+            "1024x1024 - 1024x1536 | Batch Size 1-2": ProfileSettings(
+                1, 1, 2, 1024, 1536, 1536, 1024, 1024, 1024, 75, 75, 150
             ),
         }
         self.default = ProfileSettings(
