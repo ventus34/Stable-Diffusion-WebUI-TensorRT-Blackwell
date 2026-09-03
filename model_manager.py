@@ -22,9 +22,15 @@ MODEL_FILE = os.path.join(TRT_MODEL_DIR, "model.json")
 
 
 def get_cc():
-    cc_major = torch.cuda.get_device_properties(0).major
-    cc_minor = torch.cuda.get_device_properties(0).minor
-    return cc_major, cc_minor
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            cc_major = torch.cuda.get_device_properties(0).major
+            cc_minor = torch.cuda.get_device_properties(0).minor
+            return cc_major, cc_minor
+    except Exception as e:
+        warning(f"Could not determine CUDA compute capability: {e}")
+    # Default to 12.0 (Blackwell RTX 50-series: RTX 5070 Ti, 5080, 5090)
+    return 12, 0
 
 
 cc_major, cc_minor = get_cc()
@@ -34,13 +40,19 @@ class ModelManager:
     def __init__(self, model_file=MODEL_FILE) -> None:
         self.all_models = {}
         self.model_file = model_file
-        self.cc = "cc{}{}".format(cc_major, cc_minor)
+        self.refresh_cc()
         if not os.path.exists(model_file):
             warning("Model file does not exist. Creating new one.")
         else:
             self.all_models = self.read_json()
 
         self.update()
+
+    def refresh_cc(self):
+        global cc_major, cc_minor
+        cc_major, cc_minor = get_cc()
+        self.cc = "cc{}{}".format(cc_major, cc_minor)
+        return self.cc
 
     @staticmethod
     def get_onnx_path(model_name):
@@ -49,6 +61,7 @@ class ModelManager:
         return onnx_filename, onnx_path
 
     def get_trt_path(self, model_name, model_hash, profile, static_shape):
+        self.refresh_cc()
         profile_hash = []
         n_profiles = 1 if static_shape else 3
         for k, v in profile.items():
@@ -98,7 +111,10 @@ class ModelManager:
         self.write_json()
 
     def __del__(self):
-        self.update()
+        try:
+            self.update()
+        except Exception:
+            pass
 
     def add_entry(
         self,
@@ -153,6 +169,9 @@ class ModelManager:
         self.write_json()
 
     def write_json(self):
+        parent_dir = os.path.dirname(os.path.abspath(self.model_file))
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
         with open(self.model_file, "w") as f:
             json.dump(self.all_models, f, indent=4, cls=ModelConfigEncoder)
 
@@ -172,23 +191,27 @@ class ModelManager:
         return out
 
     def available_models(self):
+        self.refresh_cc()
         available = self.all_models.get(self.cc, {})
         return available
 
     def available_loras(self):
         available = {}
-        for p in os.listdir(TRT_MODEL_DIR):
-            if not p.endswith(".lora"):
-                continue
-            available[os.path.splitext(p)[0]] = os.path.join(TRT_MODEL_DIR, p)
+        if os.path.exists(TRT_MODEL_DIR):
+            for p in os.listdir(TRT_MODEL_DIR):
+                if not p.endswith(".lora"):
+                    continue
+                available[os.path.splitext(p)[0]] = os.path.join(TRT_MODEL_DIR, p)
 
         return available
 
     def get_timing_cache(self):
+        self.refresh_cc()
         current_dir = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(current_dir, "timing_caches")
+        os.makedirs(cache_dir, exist_ok=True)
         cache = os.path.join(
-            current_dir,
-            "timing_caches",
+            cache_dir,
             "timing_cache_{}_{}.cache".format(
                 "win" if os.name == "nt" else "linux", self.cc
             ),

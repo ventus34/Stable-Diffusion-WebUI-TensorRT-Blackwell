@@ -30,9 +30,19 @@ from polygraphy.backend.trt import (
 )
 from polygraphy.logger import G_LOGGER
 import tensorrt as trt
-from logging import error, warning
-from tqdm import tqdm
-import copy
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get("total", 0)
+            self.n = 0
+
+        def update(self, n=1):
+            self.n += n
+
+        def refresh(self):
+            pass
 
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 G_LOGGER.module_severity = G_LOGGER.ERROR
@@ -166,8 +176,9 @@ class Engine:
         refitter = trt.Refitter(self.engine, TRT_LOGGER)
 
         refitted_weights = set()
-        # iterate through all tensorrt refittable weights
-        for trt_weight_name in refitter.get_all_weights():
+        # In TRT 10: get_all_weights() returns list of weight names
+        trt_weight_names = refitter.get_all_weights()
+        for trt_weight_name in trt_weight_names:
             if trt_weight_name not in refit_weights:
                 continue
 
@@ -177,8 +188,7 @@ class Engine:
                 refit_weights[trt_weight_name] = refit_weights[trt_weight_name].half()
                 trt_datatype = trt.DataType.HALF
 
-            # trt.Weight and trt.TensorLocation
-            refit_weights[trt_weight_name] = refit_weights[trt_weight_name].cpu()
+            refit_weights[trt_weight_name] = refit_weights[trt_weight_name].contiguous()
             trt_wt_tensor = trt.Weights(
                 trt_datatype,
                 refit_weights[trt_weight_name].data_ptr(),
@@ -190,15 +200,19 @@ class Engine:
                 else trt.TensorLocation.HOST
             )
 
-            # apply refit
-            # refitter.set_named_weights(trt_weight_name, trt_wt_tensor, trt_wt_location)
-            refitter.set_named_weights(trt_weight_name, trt_wt_tensor)
+            # In TRT 10, set_named_weights supports (name, weights, location) or (name, weights)
+            try:
+                refitter.set_named_weights(trt_weight_name, trt_wt_tensor, trt_wt_location)
+            except TypeError:
+                refitter.set_named_weights(trt_weight_name, trt_wt_tensor)
+
             refitted_weights.add(trt_weight_name)
 
         assert set(refitted_weights) == set(refit_weights.keys())
         if not refitter.refit_cuda_engine():
-            print("Error: failed to refit new weights.")
-            exit(0)
+            raise RuntimeError("Error: failed to refit new weights into TensorRT engine.")
+
+        print(f"[I] Total refitted weights {len(refitted_weights)}.")
 
     def build(
         self,
@@ -224,8 +238,14 @@ class Engine:
         if not enable_all_tactics:
             config_kwargs["tactic_sources"] = []
 
+        network_flags = []
+        if hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"):
+            network_flags.append(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        elif hasattr(trt.OnnxParserFlag, "NATIVE_INSTANCENORM"):
+            network_flags.append(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
+
         network = network_from_onnx_path(
-            onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
+            onnx_path, flags=network_flags
         )
         if update_output_names:
             print(f"Updating network outputs to {update_output_names}")
@@ -235,28 +255,46 @@ class Engine:
         config = builder.create_builder_config()
         config.progress_monitor = TQDMProgressMonitor()
 
-        config.set_flag(trt.BuilderFlag.FP16) if fp16 else None
-        config.set_flag(trt.BuilderFlag.REFIT) if enable_refit else None
+        # In TRT 10 strongly typed mode, precision is determined by the ONNX graph; set FP16 only if not strongly typed
+        is_strongly_typed = getattr(network[1], "has_strongly_typed_layers", False) if hasattr(network[1], "has_strongly_typed_layers") else False
+        if fp16 and hasattr(trt.BuilderFlag, "FP16") and not is_strongly_typed:
+            try:
+                config.set_flag(trt.BuilderFlag.FP16)
+            except Exception:
+                pass
+
+        if enable_refit and hasattr(trt.BuilderFlag, "REFIT"):
+            config.set_flag(trt.BuilderFlag.REFIT)
 
         cache = None
-        try:
-            with util.LockFile(timing_cache):
-                timing_cache_data = util.load_file(
-                    timing_cache, description="tactic timing cache"
+        if timing_cache:
+            timing_cache_dir = os.path.dirname(os.path.abspath(timing_cache))
+            if timing_cache_dir and not os.path.exists(timing_cache_dir):
+                os.makedirs(timing_cache_dir, exist_ok=True)
+
+            try:
+                if os.path.exists(timing_cache) and os.path.getsize(timing_cache) > 0:
+                    with util.LockFile(timing_cache):
+                        timing_cache_data = util.load_file(
+                            timing_cache, description="tactic timing cache"
+                        )
+                        cache = config.create_timing_cache(timing_cache_data)
+                else:
+                    cache = config.create_timing_cache(b"")
+            except Exception as e:
+                warning(
+                    f"Timing cache error ({e}), initializing fresh empty timing cache."
                 )
-                cache = config.create_timing_cache(timing_cache_data)
-        except FileNotFoundError:
-            warning(
-                "Timing cache file {} not found, falling back to empty timing cache.".format(
-                    timing_cache
-                )
-            )
-        if cache is not None:
-            config.set_timing_cache(cache, ignore_mismatch=True)
+                try:
+                    cache = config.create_timing_cache(b"")
+                except Exception:
+                    cache = None
+
+            if cache is not None:
+                config.set_timing_cache(cache, ignore_mismatch=True)
 
         profiles = copy.deepcopy(p)
         for profile in profiles:
-            # Last profile is used for set_calibration_profile.
             calib_profile = profile.fill_defaults(network[1]).to_trt(
                 builder, network[1]
             )
@@ -282,50 +320,85 @@ class Engine:
         print(f"Loading TensorRT engine: {self.engine_path}")
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
 
-    def activate(self, reuse_device_memory=None):
+    def activate(self, reuse_device_memory=False):
         if reuse_device_memory:
             self.context = self.engine.create_execution_context_without_device_memory()
-        #    self.context.device_memory = reuse_device_memory
         else:
             self.context = self.engine.create_execution_context()
 
-    def allocate_buffers(self, shape_dict=None, device="cuda"):
+    def allocate_buffers(self, shape_dict=None, device="cuda", additional_shapes=None):
         nvtx.range_push("allocate_buffers")
+        # Pass 1: Set shapes for all input tensors first, so dynamic output shapes are resolved by TensorRT
         for idx in range(self.engine.num_io_tensors):
-            binding = self.engine[idx]
-            if shape_dict and binding in shape_dict:
-                shape = shape_dict[binding].shape
+            name = self.engine.get_tensor_name(idx)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                if shape_dict and name in shape_dict:
+                    shape = tuple(shape_dict[name].shape)
+                elif additional_shapes and name in additional_shapes:
+                    shape = tuple(additional_shapes[name])
+                else:
+                    shape = tuple(self.context.get_tensor_shape(name))
+                self.context.set_input_shape(name, shape)
+
+        # Pass 2: Allocate or reuse buffers for all I/O tensors
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+            is_input = (self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT)
+            if is_input and shape_dict and name in shape_dict:
+                shape = tuple(shape_dict[name].shape)
+            elif additional_shapes and name in additional_shapes:
+                shape = tuple(additional_shapes[name])
             else:
-                shape = self.context.get_binding_shape(idx)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            if self.engine.binding_is_input(binding):
-                self.context.set_binding_shape(idx, shape)
-            tensor = torch.empty(
-                tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]
-            ).to(device=device)
-            self.tensors[binding] = tensor
+                shape = tuple(self.context.get_tensor_shape(name))
+
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            torch_dtype = numpy_to_torch_dtype_dict.get(dtype, torch.float32)
+
+            target_device = torch.device(device)
+            # Reuse buffer if already allocated with matching shape, dtype, and device
+            if (
+                name in self.tensors
+                and self.tensors[name].shape == shape
+                and self.tensors[name].dtype == torch_dtype
+                and self.tensors[name].device.type == target_device.type
+            ):
+                continue
+
+            self.tensors[name] = torch.zeros(shape, dtype=torch_dtype, device=device)
         nvtx.range_pop()
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
         nvtx.range_push("set_tensors")
         for name, buf in feed_dict.items():
-            self.tensors[name].copy_(buf)
+            if name in self.tensors:
+                self.tensors[name].copy_(buf)
 
         for name, tensor in self.tensors.items():
             self.context.set_tensor_address(name, tensor.data_ptr())
         nvtx.range_pop()
+
         nvtx.range_push("execute")
         noerror = self.context.execute_async_v3(stream)
         if not noerror:
-            raise ValueError("ERROR: inference failed.")
+            raise ValueError("ERROR: TensorRT inference failed.")
         nvtx.range_pop()
         return self.tensors
 
     def __str__(self):
         out = ""
         for opt_profile in range(self.engine.num_optimization_profiles):
-            for binding_idx in range(self.engine.num_bindings):
-                name = self.engine.get_binding_name(binding_idx)
-                shape = self.engine.get_profile_shape(opt_profile, name)
-                out += f"\t{name} = {shape}\n"
+            out += f"Profile {opt_profile}:\n"
+            if hasattr(self.engine, "num_io_tensors"):
+                for binding in range(self.engine.num_io_tensors):
+                    name = self.engine.get_tensor_name(binding)
+                    if hasattr(self.engine, "get_tensor_profile_shape"):
+                        shape = self.engine.get_tensor_profile_shape(name, opt_profile)
+                    else:
+                        shape = self.engine.get_profile_shape(opt_profile, name)
+                    out += f"\t{name} = {shape}\n"
+            elif hasattr(self.engine, "num_bindings"):
+                for binding_idx in range(self.engine.num_bindings):
+                    name = self.engine.get_binding_name(binding_idx)
+                    shape = self.engine.get_profile_shape(opt_profile, name)
+                    out += f"\t{name} = {shape}\n"
         return out

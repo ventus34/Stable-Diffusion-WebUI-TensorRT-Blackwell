@@ -44,6 +44,7 @@ class TrtUnet(sd_unet.SdUnet):
         self.refitted_keys = set()
 
         self.engine = None
+        self.device_memory_buffer = None
 
     def forward(
         self,
@@ -55,17 +56,25 @@ class TrtUnet(sd_unet.SdUnet):
     ) -> torch.Tensor:
         nvtx.range_push("forward")
         feed_dict = {
-            "sample": x.float(),
-            "timesteps": timesteps.float(),
-            "encoder_hidden_states": context.float(),
+            "sample": x,
+            "timesteps": timesteps,
+            "encoder_hidden_states": context,
         }
-        if "y" in kwargs:
-            feed_dict["y"] = kwargs["y"].float()
+        if "y" in kwargs and kwargs["y"] is not None:
+            feed_dict["y"] = kwargs["y"]
+        elif len(args) > 0 and args[0] is not None:
+            feed_dict["y"] = args[0]
 
-        tmp = torch.empty(
-            self.engine_vram_req, dtype=torch.uint8, device=devices.device
-        )
-        self.engine.context.device_memory = tmp.data_ptr()
+        if self.engine_vram_req > 0:
+            if (
+                self.device_memory_buffer is None
+                or self.device_memory_buffer.numel() < self.engine_vram_req
+            ):
+                self.device_memory_buffer = torch.empty(
+                    self.engine_vram_req, dtype=torch.uint8, device=devices.device
+                )
+            self.engine.context.device_memory = self.device_memory_buffer.data_ptr()
+
         self.cudaStream = torch.cuda.current_stream().cuda_stream
         self.engine.allocate_buffers(feed_dict)
 
@@ -101,7 +110,19 @@ class TrtUnet(sd_unet.SdUnet):
         self.engine.activate(True)
 
     def deactivate(self):
+        try:
+            if (
+                hasattr(shared, "sd_model")
+                and shared.sd_model is not None
+                and hasattr(shared.sd_model, "model")
+                and hasattr(shared.sd_model.model, "diffusion_model")
+            ):
+                shared.sd_model.model.diffusion_model.to(devices.device)
+        except Exception:
+            pass
+        self.device_memory_buffer = None
         del self.engine
+        self.engine = None
 
 
 class TensorRTScript(scripts.Script):
@@ -201,7 +222,7 @@ class TensorRTScript(scripts.Script):
 
         # get lora from prompt
         _prompt = p.prompt
-        extra_networks = re.findall("\<(.*?)\>", _prompt)
+        extra_networks = re.findall(r"<(.*?)>", _prompt)
         loras = [net for net in extra_networks if net.startswith("lora")]
 
         # Avoid that extra networks will be loaded

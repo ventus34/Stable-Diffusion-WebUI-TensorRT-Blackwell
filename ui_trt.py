@@ -26,17 +26,19 @@ logging.basicConfig(level=logging.INFO)
 
 
 def get_context_dim():
-    if shared.sd_model.is_sd1:
-        return 768
-    elif shared.sd_model.is_sd2:
-        return 1024
-    elif shared.sd_model.is_sdxl:
-        return 2048
+    if hasattr(shared, "sd_model") and shared.sd_model is not None:
+        if getattr(shared.sd_model, "is_sd1", False):
+            return 768
+        elif getattr(shared.sd_model, "is_sd2", False):
+            return 1024
+        elif getattr(shared.sd_model, "is_sdxl", False):
+            return 2048
+    return 768
 
 
 def is_fp32():
     use_fp32 = False
-    if cc_major < 7:
+    if 0 < cc_major < 7:
         use_fp32 = True
         print("FP16 has been disabled because your GPU does not support it.")
     return use_fp32
@@ -454,7 +456,7 @@ def on_ui_tabs():
                                     maximum=16,
                                     step=1,
                                     label="Max batch-size",
-                                    value=default_vals.bs_min,
+                                    value=default_vals.bs_max,
                                     elem_id="trt_max_batch",
                                 )
 
@@ -663,7 +665,6 @@ def on_ui_tabs():
                 for i, profile in enumerate(profiles):
                     profiles_md_string += f"#### Profile {i} \n{profile}\n\n"
                 profiles_md_string += "</details>\n"
-            profiles_md_string += "</details>\n"
 
             profiles_md_string += "\n --- \n ## LoRA Profiles \n"
             for model, details in lora_cards.items():

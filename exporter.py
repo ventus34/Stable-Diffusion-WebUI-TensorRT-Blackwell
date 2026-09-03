@@ -12,10 +12,26 @@ import torch.nn.functional as F
 import numpy as np
 import onnx
 from onnx import numpy_helper
-from optimum.onnx.utils import (
-    _get_onnx_external_data_tensors,
-    check_model_uses_external_data,
-)
+try:
+    from optimum.onnx.utils import (
+        _get_onnx_external_data_tensors,
+        check_model_uses_external_data,
+    )
+except ImportError:
+    def check_model_uses_external_data(model):
+        for initializer in model.graph.initializer:
+            if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
+                return True
+        return False
+
+    def _get_onnx_external_data_tensors(model):
+        paths = []
+        for initializer in model.graph.initializer:
+            if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
+                for entry in initializer.external_data:
+                    if entry.key == "location":
+                        paths.append(entry.value)
+        return paths
 
 
 from modules import shared
@@ -121,15 +137,21 @@ def export_lora(
 
 def swap_sdpa(func):
     def wrapper(*args, **kwargs):
-        swap_sdpa = hasattr(F, "scaled_dot_product_attention")
-        old_sdpa = (
-            getattr(F, "scaled_dot_product_attention", None) if swap_sdpa else None
-        )
+        old_sdpa = getattr(F, "scaled_dot_product_attention", None)
+        swap_sdpa = old_sdpa is not None
         if swap_sdpa:
-            delattr(F, "scaled_dot_product_attention")
-        ret = func(*args, **kwargs)
-        if swap_sdpa and old_sdpa:
-            setattr(F, "scaled_dot_product_attention", old_sdpa)
+            try:
+                delattr(F, "scaled_dot_product_attention")
+            except Exception:
+                pass
+        try:
+            ret = func(*args, **kwargs)
+        finally:
+            if swap_sdpa and old_sdpa is not None:
+                try:
+                    setattr(F, "scaled_dot_product_attention", old_sdpa)
+                except Exception:
+                    pass
         return ret
 
     return wrapper
@@ -223,22 +245,31 @@ def _export_onnx(
 def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool):
     engine = Engine(trt_path)
 
-    # TODO Still approx. 2gb of VRAM unaccounted for...
-    model = shared.sd_model.cpu()
-    torch.cuda.empty_cache()
+    model = None
+    if hasattr(shared, "sd_model") and shared.sd_model is not None:
+        try:
+            model = shared.sd_model.cpu()
+            torch.cuda.empty_cache()
+        except Exception as e:
+            info(f"Could not move model to CPU: {e}")
 
-    s = time.time()
-    ret = engine.build(
-        onnx_path,
-        use_fp16,
-        enable_refit=True,
-        enable_preview=True,
-        timing_cache=timing_cache,
-        input_profile=[profile],
-        # hwCompatibility=hwCompatibility,
-    )
-    e = time.time()
-    info(f"Time taken to build: {(e-s)}s")
-
-    shared.sd_model = model.cuda()
-    return ret
+    try:
+        s = time.time()
+        ret = engine.build(
+            onnx_path,
+            use_fp16,
+            enable_refit=True,
+            enable_preview=True,
+            timing_cache=timing_cache,
+            input_profile=[profile],
+            # hwCompatibility=hwCompatibility,
+        )
+        e = time.time()
+        info(f"Time taken to build: {(e-s):.2f}s")
+        return ret
+    finally:
+        if model is not None:
+            try:
+                shared.sd_model = model.cuda()
+            except Exception as e:
+                info(f"Could not restore model to CUDA: {e}")

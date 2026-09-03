@@ -92,7 +92,7 @@ class UNetModel(torch.nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor]:
-        return (
+        inputs = [
             torch.randn(
                 batch_size,
                 self.in_channels,
@@ -109,10 +109,12 @@ class UNetModel(torch.nn.Module):
                 dtype=dtype,
                 device=device,
             ),
-            torch.randn(batch_size, self.num_xl_classes, dtype=dtype, device=device)
-            if self.is_xl
-            else None,
-        )
+        ]
+        if self.is_xl:
+            inputs.append(
+                torch.randn(batch_size, self.num_xl_classes, dtype=dtype, device=device)
+            )
+        return tuple(inputs)
 
     def get_input_profile(self, profile: ProfileSettings) -> dict:
         min_batch, opt_batch, max_batch = profile.get_a1111_batch_dim()
@@ -149,7 +151,7 @@ class UNetModel(torch.nn.Module):
 
     # Helper utility for weights map
     def export_weights_map(self, onnx_opt_path: str, weights_map_path: dict):
-        onnx_opt_dir = onnx_opt_path
+        onnx_opt_dir = os.path.dirname(onnx_opt_path)
         state_dict = self.unet.state_dict()
         onnx_opt_model = onnx.load(onnx_opt_path)
 
@@ -259,7 +261,13 @@ class Optimizer:
 
     def infer_shapes(self, return_onnx=False):
         onnx_graph = gs.export_onnx(self.graph)
-        if onnx_graph.ByteSize() > 2147483648:
+        is_large = False
+        try:
+            is_large = onnx_graph.ByteSize() > 2147483648
+        except Exception:
+            is_large = True
+
+        if is_large:
             temp_dir = tempfile.TemporaryDirectory().name
             os.makedirs(temp_dir, exist_ok=True)
             onnx_orig_path = os.path.join(temp_dir, "model.onnx")
