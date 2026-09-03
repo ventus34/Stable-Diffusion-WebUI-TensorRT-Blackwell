@@ -88,15 +88,18 @@ class TrtUnet(sd_unet.SdUnet):
         elif len(args) > 0 and args[0] is not None:
             feed_dict["y"] = args[0]
 
-        if self.engine_vram_req > 0:
-            if (
-                self.device_memory_buffer is None
-                or self.device_memory_buffer.numel() < self.engine_vram_req
-            ):
-                self.device_memory_buffer = torch.empty(
-                    self.engine_vram_req, dtype=torch.uint8, device=devices.device
-                )
-            self.engine.context.device_memory = self.device_memory_buffer.data_ptr()
+        if self.engine_vram_req > 0 and hasattr(self.engine.context, "device_memory"):
+            try:
+                if (
+                    self.device_memory_buffer is None
+                    or self.device_memory_buffer.numel() < self.engine_vram_req
+                ):
+                    self.device_memory_buffer = torch.empty(
+                        self.engine_vram_req, dtype=torch.uint8, device=devices.device
+                    )
+                self.engine.context.device_memory = self.device_memory_buffer.data_ptr()
+            except Exception:
+                pass
 
         self.cudaStream = torch.cuda.current_stream().cuda_stream
         self.engine.allocate_buffers(feed_dict)
@@ -129,8 +132,12 @@ class TrtUnet(sd_unet.SdUnet):
         self.engine.load()
         print(f"\nLoaded Profile: {self.profile_idx}")
         print(self.engine)
-        self.engine_vram_req = self.engine.engine.device_memory_size
-        self.engine.activate(True)
+        self.engine_vram_req = getattr(
+            self.engine.engine,
+            "device_memory_size_v2",
+            getattr(self.engine.engine, "device_memory_size", 0),
+        )
+        self.engine.activate(reuse_device_memory=(self.engine_vram_req > 0))
 
     def deactivate(self):
         try:

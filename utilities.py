@@ -333,10 +333,13 @@ class Engine:
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
 
     def activate(self, reuse_device_memory=False):
-        if reuse_device_memory:
-            self.context = self.engine.create_execution_context_without_device_memory()
-        else:
-            self.context = self.engine.create_execution_context()
+        if reuse_device_memory and hasattr(self.engine, "create_execution_context_without_device_memory"):
+            try:
+                self.context = self.engine.create_execution_context_without_device_memory()
+                return
+            except Exception:
+                pass
+        self.context = self.engine.create_execution_context()
 
     def allocate_buffers(self, shape_dict=None, device="cuda", additional_shapes=None):
         nvtx.range_push("allocate_buffers")
