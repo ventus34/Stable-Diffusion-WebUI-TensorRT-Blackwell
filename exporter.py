@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import shutil
 import json
@@ -135,19 +136,37 @@ def export_lora(
     return refit_dict
 
 
+def _math_scaled_dot_product_attention(
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+):
+    scale_factor = 1.0 / math.sqrt(query.size(-1)) if scale is None else scale
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    if is_causal:
+        L, S = query.size(-2), key.size(-2)
+        mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        scores = scores.masked_fill(~mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+        else:
+            scores = scores + attn_mask
+    attn_weights = torch.softmax(scores, dim=-1)
+    return torch.matmul(attn_weights, value)
+
+
 def swap_sdpa(func):
     def wrapper(*args, **kwargs):
         old_sdpa = getattr(F, "scaled_dot_product_attention", None)
-        swap_sdpa = old_sdpa is not None
-        if swap_sdpa:
-            try:
-                delattr(F, "scaled_dot_product_attention")
-            except Exception:
-                pass
+        # Instead of deleting scaled_dot_product_attention (which causes AttributeError in reForge/ldm_patched),
+        # replace it with a pure-math implementation that is 100% exportable to ONNX across all backends.
+        try:
+            setattr(F, "scaled_dot_product_attention", _math_scaled_dot_product_attention)
+        except Exception:
+            pass
         try:
             ret = func(*args, **kwargs)
         finally:
-            if swap_sdpa and old_sdpa is not None:
+            if old_sdpa is not None:
                 try:
                     setattr(F, "scaled_dot_product_attention", old_sdpa)
                 except Exception:
