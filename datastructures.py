@@ -59,16 +59,32 @@ class ModelConfig:
     unet_hidden_dim: int = 4
 
     def is_compatible_from_dict(self, feed_dict: dict):
-        distance = 0
+        distance = 0.0
         for k, v in feed_dict.items():
+            if k not in self.profile:
+                continue
             _min, _opt, _max = self.profile[k]
-            v_tensor = torch.Tensor(list(v.shape))
+            v_tensor = torch.Tensor(list(v.shape)) if hasattr(v, "shape") else torch.Tensor(list(v))
             r_min = torch.Tensor(_max) - v_tensor
             r_opt = (torch.Tensor(_opt) - v_tensor).abs()
             r_max = v_tensor - torch.Tensor(_min)
             if torch.any(r_min < 0) or torch.any(r_max < 0):
                 return (False, distance)
-            distance += r_opt.sum() + 0.5 * (r_max.sum() + 0.5 * r_min.sum())
+            distance += float(r_opt.sum().item() + 0.5 * (r_max.sum().item() + 0.5 * r_min.sum().item()))
+
+        if self.static_shapes:
+            is_exact = True
+            for k, v in feed_dict.items():
+                if k in self.profile:
+                    opt_shape = self.profile[k][1]
+                    v_shape = list(v.shape) if hasattr(v, "shape") else list(v)
+                    if v_shape != list(opt_shape):
+                        is_exact = False
+                        break
+            distance += -1000.0 if is_exact else -100.0
+        else:
+            distance += 50.0
+
         return (True, distance)
 
     def is_compatible(

@@ -72,23 +72,84 @@ def format_profile_summary(config) -> str:
         return "Static" if getattr(config, "static_shapes", False) else "Dynamic"
 
 
-def get_prompt_token_count(prompt: str) -> int:
-    if not prompt or not str(prompt).strip():
+def count_clip_tokens(text: str) -> int:
+    if not text or not str(text).strip():
         return 77
+    text = re.sub(r"<[^>]+>", "", str(text).strip())
+
+    # 1. Try official tokenizer from loaded model
     try:
         if hasattr(shared, "sd_model") and shared.sd_model is not None:
             cond_stage = getattr(shared.sd_model, "cond_stage_model", None)
-            if cond_stage and hasattr(cond_stage, "tokenize"):
-                rem = cond_stage.tokenize([prompt])
-                if isinstance(rem, list) and len(rem) > 0:
-                    tok_len = len(rem[0]) if isinstance(rem[0], list) else len(rem)
+            if cond_stage is not None:
+                if hasattr(cond_stage, "tokenize"):
+                    rem = cond_stage.tokenize([text])
+                    if isinstance(rem, list) and len(rem) > 0:
+                        tok_len = len(rem[0]) if isinstance(rem[0], list) else len(rem)
+                        chunks = max(1, (tok_len + 74) // 75)
+                        return chunks * 77
+                tok = getattr(cond_stage, "tokenizer", None) or getattr(
+                    getattr(cond_stage, "wrapped", None), "tokenizer", None
+                )
+                if tok is not None and hasattr(tok, "encode"):
+                    tok_len = len(tok.encode(text))
                     chunks = max(1, (tok_len + 74) // 75)
                     return chunks * 77
+            if hasattr(shared, "sd_model", None) and hasattr(shared.sd_model, "forge_objects"):
+                clip = shared.sd_model.forge_objects.get("clip", None)
+                if clip is not None:
+                    tok = getattr(clip, "tokenizer", None)
+                    if tok is not None and hasattr(tok, "tokenize_with_weights"):
+                        tokens = tok.tokenize_with_weights(text)
+                        max_len = max([len(v) for v in tokens.values()]) if tokens else 0
+                        if max_len > 0:
+                            chunks = max(1, (max_len + 74) // 75)
+                            return chunks * 77
     except Exception:
         pass
-    tokens_approx = len(re.findall(r"\w+|[^\w\s]", str(prompt)))
-    chunks = max(1, (int(tokens_approx * 1.15) + 74) // 75)
+
+    # 2. Heuristic CLIP BPE tokenizer estimation
+    tokens_raw = re.findall(r"\w+|[^\w\s]", text)
+    bpe_estimate = 0.0
+    for t in tokens_raw:
+        if len(t) <= 3:
+            bpe_estimate += 1.0
+        elif len(t) <= 7:
+            bpe_estimate += 1.3
+        elif len(t) <= 12:
+            bpe_estimate += 2.0
+        else:
+            bpe_estimate += 3.0
+    total = int(bpe_estimate) + 2  # BOS and EOS tokens
+    chunks = max(1, (total + 74) // 75)
     return chunks * 77
+
+
+def get_max_prompt_token_count(p) -> (int, dict):
+    pos_texts = []
+    if hasattr(p, "prompt") and p.prompt:
+        pos_texts.append(str(p.prompt))
+    if hasattr(p, "all_prompts") and p.all_prompts:
+        pos_texts.extend([str(x) for x in p.all_prompts if x])
+
+    neg_texts = []
+    if hasattr(p, "negative_prompt") and p.negative_prompt:
+        neg_texts.append(str(p.negative_prompt))
+    if hasattr(p, "all_negative_prompts") and p.all_negative_prompts:
+        neg_texts.extend([str(x) for x in p.all_negative_prompts if x])
+
+    pos_tokens = max([count_clip_tokens(t) for t in pos_texts]) if pos_texts else 77
+    neg_tokens = max([count_clip_tokens(t) for t in neg_texts]) if neg_texts else 77
+    final_tokens = max(pos_tokens, neg_tokens, 77)
+
+    has_wildcards = any("__" in t or "{" in t for t in pos_texts + neg_texts)
+    info = {
+        "pos": pos_tokens,
+        "neg": neg_tokens,
+        "final": final_tokens,
+        "has_wildcards": has_wildcards,
+    }
+    return final_tokens, info
 
 
 class TrtUnetOption(sd_unet.SdUnetOption):
@@ -113,6 +174,7 @@ class TrtUnetOption(sd_unet.SdUnetOption):
 
     def create_unet(self):
         unet = TrtUnet(self.model_name, self.configs)
+        unet.is_auto = (self.forced_profile_idx is None)
         if self.forced_profile_idx is not None:
             unet.profile_idx = self.forced_profile_idx
         return unet
@@ -128,6 +190,7 @@ class TrtUnet(sd_unet.SdUnet):
 
         self.profile_idx = 0
         self.loaded_config = None
+        self.is_auto = True
 
         self.engine_vram_req = 0
         self.refitted_keys = set()
@@ -187,6 +250,35 @@ class TrtUnet(sd_unet.SdUnet):
         for k, v in list(feed_dict.items()):
             if isinstance(v, torch.Tensor) and v.device.type != "cuda":
                 feed_dict[k] = v.to(device=devices.device)
+
+        if self.step_idx == 1:
+            cur_config = self.loaded_config["config"] if self.loaded_config else None
+            is_compat = False
+            if cur_config:
+                is_compat, _ = cur_config.is_compatible_from_dict(feed_dict)
+
+            if getattr(self, "is_auto", True) or not is_compat:
+                valid_models, distances, idx = modelmanager.get_valid_models_from_dict(self.model_name, feed_dict)
+                if len(valid_models) > 0:
+                    best_idx = idx[np.argmin(distances)]
+                    if best_idx != self.profile_idx:
+                        tokens = context.shape[1] if context is not None else "?"
+                        h_px = x.shape[2] * 8
+                        w_px = x.shape[3] * 8
+                        print(
+                            f"[TensorRT] Step 1 runtime shape check: Switching from Profile {self.profile_idx} "
+                            f"to Profile {best_idx} for exact shape {w_px}x{h_px} (exact runtime CLIP tokens: {tokens})",
+                            flush=True,
+                        )
+                        self.profile_idx = best_idx
+                        self.switch_engine()
+                        self.step_idx = 1
+                elif not is_compat:
+                    print(
+                        f"[TensorRT] Warning: Active Profile {self.profile_idx} is incompatible with runtime input shapes "
+                        f"(tokens: {context.shape[1] if context is not None else '?'}, latents: {tuple(x.shape)}).",
+                        flush=True,
+                    )
 
         if (
             getattr(self.engine, "is_reusing_device_memory", False)
@@ -323,6 +415,7 @@ class TensorRTScript(scripts.Script):
         self.idx = None
         self.hr_idx = None
         self.torch_unet = False
+        self.is_auto = True
 
     def title(self):
         return "TensorRT"
@@ -367,7 +460,7 @@ class TensorRTScript(scripts.Script):
                     "HIRES Fix resolution must be divisible by 64 in both dimensions. Please change the upscale factor or disable HIRES Fix."
                 )
 
-    def get_profile_idx(self, p, model_name: str, model_type: ModelType) -> (int, int):
+    def get_profile_idx(self, p, model_name: str, model_type: ModelType, prompt_tokens: int = None) -> (int, int):
         best_hr = None
 
         if self.is_img2img:
@@ -375,7 +468,9 @@ class TensorRTScript(scripts.Script):
         else:
             hr_scale = p.hr_scale if p.enable_hr else 1
 
-        prompt_tokens = get_prompt_token_count(getattr(p, "prompt", ""))
+        if prompt_tokens is None:
+            prompt_tokens, _ = get_max_prompt_token_count(p)
+
         (
             valid_models,
             distances,
@@ -402,7 +497,7 @@ class TensorRTScript(scripts.Script):
 
         if len(valid_models) == 0:
             gr.Error(
-                f"""No valid profile found for ({model_name}) LOWRES ({p.width}x{p.height}, bs={p.batch_size}). 
+                f"""No valid profile found for ({model_name}) LOWRES ({p.width}x{p.height}, bs={p.batch_size}, tokens={prompt_tokens}). 
                 Please go to the TensorRT tab and generate an engine with the necessary profile, or use PyTorch fallback."""
             )
             return None, None
@@ -551,18 +646,27 @@ class TensorRTScript(scripts.Script):
         if profile_override is not None:
             self.idx = profile_override
             self.hr_idx = profile_override
+            self.is_auto = False
             print(f"[TensorRT] UI override: forced Profile {self.idx}", flush=True)
         elif getattr(sd_unet_option, "forced_profile_idx", None) is not None:
             self.idx = sd_unet_option.forced_profile_idx
             self.hr_idx = sd_unet_option.forced_profile_idx
+            self.is_auto = False
             print(f"[TensorRT] SD Unet option: forced Profile {self.idx}", flush=True)
         else:
-            self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET)
-            print(f"[TensorRT] Selected Profile: {self.idx} (HR: {self.hr_idx})", flush=True)
+            self.is_auto = True
+            prompt_tokens, token_info = get_max_prompt_token_count(p)
+            self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET, prompt_tokens=prompt_tokens)
+            print(
+                f"[TensorRT] Auto selected Profile: {self.idx} (HR: {self.hr_idx}) "
+                f"[tokens: {prompt_tokens} (pos: {token_info['pos']}, neg: {token_info['neg']})]",
+                flush=True,
+            )
 
         num_profiles = len(sd_unet_option.configs) if hasattr(sd_unet_option, "configs") else 0
         if self.idx is not None and num_profiles > 0 and self.idx >= num_profiles:
             gr.Warning(f"[TensorRT] Selected Profile {self.idx} is out of range ({num_profiles} available). Reverting to Auto.")
+            self.is_auto = True
             self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET)
 
         self.torch_unet = self.idx is None or self.hr_idx is None
@@ -584,6 +688,7 @@ class TensorRTScript(scripts.Script):
             and sd_unet.current_unet is not None
             and not self.torch_unet
         ):
+            sd_unet.current_unet.is_auto = getattr(self, "is_auto", True)
             if self.idx is not None and sd_unet.current_unet.profile_idx != self.idx:
                 print(
                     f"[TensorRT] Switching active engine from Profile {sd_unet.current_unet.profile_idx} to Profile {self.idx}",
@@ -615,6 +720,7 @@ class TensorRTScript(scripts.Script):
                 self.update_lora = True
         sd_unet.current_unet = sd_unet_option.create_unet()
         sd_unet.current_unet.profile_idx = self.idx
+        sd_unet.current_unet.is_auto = getattr(self, "is_auto", True)
         sd_unet.current_unet.option = sd_unet_option
         sd_unet.current_unet_option = sd_unet_option
 
@@ -625,6 +731,18 @@ class TensorRTScript(scripts.Script):
         # Called for each batch count
         if self.torch_unet:
             return super().process_batch(p, *args, **kwargs)
+
+        # Check if prompts were expanded by wildcard extensions during process()
+        if getattr(self, "is_auto", True):
+            prompt_tokens, token_info = get_max_prompt_token_count(p)
+            new_idx, new_hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET, prompt_tokens=prompt_tokens)
+            if new_idx is not None and new_idx != self.idx:
+                print(
+                    f"[TensorRT] process_batch: updated profile to {new_idx} after prompt expansion ({token_info})",
+                    flush=True,
+                )
+                self.idx = new_idx
+                self.hr_idx = new_hr_idx
 
         if sd_unet.current_unet is not None and self.idx is not None and self.idx != sd_unet.current_unet.profile_idx:
             print(f"[TensorRT] process_batch: switching to Profile {self.idx}", flush=True)
