@@ -87,17 +87,17 @@ def export_unet_to_trt(
         use_fp32 = is_fp32()
 
         print(f"\n========================================================", flush=True)
-        print(f"[TensorRT] ROZPOCZĘCIE EKSPORTU SILNIKA", flush=True)
+        print(f"[TensorRT] STARTING ENGINE EXPORT", flush=True)
         print(f"[TensorRT] Model: {model_name} ({'SDXL' if is_xl else 'SD 1.5/2.1'})", flush=True)
-        print(f"[TensorRT] Ustawienia profilu: {profile_settings}", flush=True)
-        print(f"[TensorRT] Precyzja: {'FP32' if use_fp32 else 'FP16'}", flush=True)
+        print(f"[TensorRT] Profile Settings: {profile_settings}", flush=True)
+        print(f"[TensorRT] Precision: {'FP32' if use_fp32 else 'FP16'}", flush=True)
         print(f"========================================================\n", flush=True)
 
         yield (
-            f"### ⏳ [Krok 1/3] Przygotowywanie modelu do eksportu...\n"
+            f"### ⏳ [Step 1/3] Preparing model for export...\n"
             f"- **Model:** `{model_name}`\n"
-            f"- **Profil:** `{profile_settings.w_opt}x{profile_settings.h_opt}` (batch: {profile_settings.bs_opt})\n"
-            f"*Szczegółowe postępy są na bieżąco wypisywane w konsoli/terminalu.*"
+            f"- **Profile:** `{profile_settings.w_opt}x{profile_settings.h_opt}` (batch: {profile_settings.bs_opt})\n"
+            f"*Detailed progress is logged in the console/terminal.*"
         )
 
         profile_settings.token_to_dim(static_shapes)
@@ -142,7 +142,7 @@ def export_unet_to_trt(
                     if buf.device != target_device:
                         buf.data = buf.data.to(target_device)
         except Exception as e:
-            print(f"[TensorRT] Info: synchronizacja wag na GPU: {e}", flush=True)
+            print(f"[TensorRT] Info: synchronizing weights to GPU: {e}", flush=True)
 
         modelobj = UNetModel(
             shared.sd_model.model.diffusion_model,
@@ -156,9 +156,9 @@ def export_unet_to_trt(
 
         if not os.path.exists(onnx_path):
             yield (
-                f"### ⏳ [Krok 1/3] Trwa eksportowanie modelu do formatu ONNX...\n"
-                f"- Plik: `{onnx_path}`\n"
-                f"*Dla modeli SDXL tracing i serializacja zajmuje zwykle 1–3 minuty. Proszę nie odświeżać strony.*"
+                f"### ⏳ [Step 1/3] Exporting model to ONNX format...\n"
+                f"- File: `{onnx_path}`\n"
+                f"*For SDXL models, tracing and serialization typically takes 1–3 minutes. Please do not refresh the page.*"
             )
 
         export_onnx(
@@ -176,10 +176,10 @@ def export_unet_to_trt(
 
         if not os.path.exists(trt_path) or force_export:
             yield (
-                f"### ⚙️ [Krok 2/3] Trwa kompilacja silnika TensorRT dla RTX 5070 Ti (sm_120)...\n"
-                f"- **Plik docelowy:** `{trt_engine_filename}`\n"
-                f"- **Status:** TensorRT profiluje taktyki obliczeniowe dla Twojego GPU.\n"
-                f"*Ten etap zajmuje 2–6 minut. Podgląd faz widoczny w konsoli.*"
+                f"### ⚙️ [Step 2/3] Building TensorRT engine for RTX 5070 Ti (sm_120)...\n"
+                f"- **Target File:** `{trt_engine_filename}`\n"
+                f"- **Status:** TensorRT is profiling compute tactics for your GPU.\n"
+                f"*This step takes 2–6 minutes. Progress updates are visible in the console.*"
             )
 
             ret = export_trt(
@@ -191,12 +191,12 @@ def export_unet_to_trt(
             )
             if ret:
                 yield (
-                    f"### ❌ Kompilacja silnika TensorRT zakończyła się niepowodzeniem (kod błędu {ret}).\n"
-                    f"*Szczegółowy komunikat błędu oraz traceback zostały wypisane w konsoli terminala.*"
+                    f"### ❌ TensorRT engine compilation failed (error code {ret}).\n"
+                    f"*Detailed error message and traceback are logged in the terminal console.*"
                 )
                 return
 
-            print(f"[TensorRT] Dodawanie wpisu silnika do model.json...", flush=True)
+            print(f"[TensorRT] Adding engine entry to model.json...", flush=True)
             modelmanager.add_entry(
                 model_name,
                 model_hash,
@@ -211,27 +211,27 @@ def export_unet_to_trt(
             )
         else:
             print(
-                f"[TensorRT] Silnik TensorRT już istnieje: {trt_path}. Pomijanie kompilacji.", flush=True
+                f"[TensorRT] TensorRT engine already exists: {trt_path}. Skipping compilation.", flush=True
             )
 
         gc.collect()
         torch.cuda.empty_cache()
 
         yield (
-            f"### ✅ [Krok 3/3] Silnik TensorRT został pomyślnie skompilowany i zapisany!\n\n"
-            f"- **Plik silnika:** `{trt_engine_filename}`\n"
-            f"- **Rozdzielczość:** `{profile_settings.w_opt}x{profile_settings.h_opt}`\n"
+            f"### ✅ [Step 3/3] TensorRT engine compiled and saved successfully!\n\n"
+            f"- **Engine File:** `{trt_engine_filename}`\n"
+            f"- **Resolution:** `{profile_settings.w_opt}x{profile_settings.h_opt}`\n"
             f"- **Batch:** `{profile_settings.bs_opt}`\n\n"
-            f"**Jak używać:** Wybierz profil w `sd_unet` (lub ustaw na `Automatic`) i generuj obrazy w `txt2img`."
+            f"**How to use:** Select the profile in `sd_unet` (or set to `Automatic`) and generate images in `txt2img`."
         )
 
     except Exception as e:
-        print(f"\n[TensorRT BŁĄD PODCZAS EKSPORTU]: {e}", flush=True)
+        print(f"\n[TensorRT EXPORT ERROR]: {e}", flush=True)
         import traceback
         traceback.print_exc()
         yield (
-            f"### ❌ Wystąpił błąd podczas eksportu: `{e}`\n\n"
-            f"Szczegółowy traceback znajduje się w oknie terminala/konsoli WebUI."
+            f"### ❌ Error during export: `{e}`\n\n"
+            f"Detailed traceback is available in the WebUI terminal/console."
         )
 
 

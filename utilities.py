@@ -309,24 +309,24 @@ class Engine:
             config.add_optimization_profile(calib_profile)
 
         try:
-            print(f"[TensorRT] Kompilacja sieci i przeszukiwanie taktyk jądra (engine_from_network)...", flush=True)
-            print(f"[TensorRT] Może to zająć od 2 do 8 minut w zależności od rozdzielczości i modelu. Proszę czekać...", flush=True)
+            print(f"[TensorRT] Compiling network and profiling kernel tactics (engine_from_network)...", flush=True)
+            print(f"[TensorRT] This may take 2 to 8 minutes depending on model and resolution. Please wait...", flush=True)
             engine = engine_from_network(
                 network,
                 config,
                 save_timing_cache=timing_cache,
             )
         except Exception as e:
-            print(f"[TensorRT BŁĄD] Kompilacja silnika TensorRT nie powiodła się: {e}", flush=True)
+            print(f"[TensorRT ERROR] TensorRT engine compilation failed: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return 1
         try:
-            print(f"[TensorRT] Zapisywanie skompilowanego silnika do: {self.engine_path}", flush=True)
+            print(f"[TensorRT] Saving compiled engine to: {self.engine_path}", flush=True)
             save_engine(engine, path=self.engine_path)
-            print(f"[TensorRT] Silnik TensorRT został pomyślnie zapisany na dysku!", flush=True)
+            print(f"[TensorRT] TensorRT engine saved to disk successfully!", flush=True)
         except Exception as e:
-            print(f"[TensorRT BŁĄD] Zapis pliku silnika nie powiódł się: {e}", flush=True)
+            print(f"[TensorRT ERROR] Failed to save engine file: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return 1

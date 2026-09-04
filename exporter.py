@@ -185,7 +185,7 @@ def export_onnx(
     opset: int = 17,
     diable_optimizations: bool = False,
 ):
-    print(f"[TensorRT] Przygotowywanie wag do eksportu ONNX...", flush=True)
+    print(f"[TensorRT] Preparing weights for ONNX export...", flush=True)
     inputs = modelobj.get_sample_input(
         profile.bs_opt * 2,
         profile.h_opt // 8,
@@ -205,7 +205,7 @@ def export_onnx(
             modelobj.optimize if not diable_optimizations else None,
         )
     else:
-        print(f"[TensorRT] Znaleziono istniejący plik ONNX: {onnx_path} (pomijanie powtórnego eksportu)", flush=True)
+        print(f"[TensorRT] Found existing ONNX model: {onnx_path} (skipping re-export)", flush=True)
 
 
 def _export_onnx(
@@ -215,13 +215,13 @@ def _export_onnx(
         import onnxscript
     except ImportError:
         try:
-            print("[TensorRT] Wykryto brak pakietu 'onnxscript' wymaganego przez nowsze wersje PyTorch. Instalowanie w tle...", flush=True)
+            print("[TensorRT] Missing required 'onnxscript' package for modern PyTorch. Installing in background...", flush=True)
             import subprocess
             subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxscript"])
             import onnxscript
-            print("[TensorRT] Pakiet 'onnxscript' został pomyślnie zainstalowany!", flush=True)
+            print("[TensorRT] Package 'onnxscript' installed successfully!", flush=True)
         except Exception as err:
-            print(f"[TensorRT] Uwaga: Automatyczna instalacja onnxscript nie powiodła się: {err}", flush=True)
+            print(f"[TensorRT] Warning: Automatic installation of onnxscript failed: {err}", flush=True)
 
     tmp_dir = os.path.abspath("onnx_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -237,7 +237,7 @@ def _export_onnx(
             if b.device != target_device:
                 b.data = b.data.to(target_device)
     except Exception as e:
-        print(f"[TensorRT] Info: Weryfikacja urządzeń parametrów modelu: {e}", flush=True)
+        print(f"[TensorRT] Info: Model parameter device verification: {e}", flush=True)
 
     export_kwargs = {
         "export_params": True,
@@ -255,8 +255,8 @@ def _export_onnx(
         export_kwargs["dynamo"] = False
 
     try:
-        print(f"[TensorRT] Eksportowanie grafu PyTorch do ONNX (plik roboczy: {tmp_path})...", flush=True)
-        print(f"[TensorRT] To może potrwać 1–3 minuty. Proszę czekać...", flush=True)
+        print(f"[TensorRT] Exporting PyTorch graph to ONNX (working file: {tmp_path})...", flush=True)
+        print(f"[TensorRT] This may take 1–3 minutes. Please wait...", flush=True)
         with torch.inference_mode(), torch.autocast("cuda"):
             torch.onnx.export(
                 model,
@@ -264,22 +264,22 @@ def _export_onnx(
                 tmp_path,
                 **export_kwargs,
             )
-        print(f"[TensorRT] Graf ONNX wyeksportowany pomyślnie!", flush=True)
+        print(f"[TensorRT] ONNX graph exported successfully!", flush=True)
     except Exception as e:
-        print(f"[TensorRT BŁĄD] Eksport do ONNX nie powiódł się: {e}", flush=True)
+        print(f"[TensorRT ERROR] ONNX export failed: {e}", flush=True)
         import traceback
         traceback.print_exc()
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"Błąd podczas torch.onnx.export: {e}")
+        raise RuntimeError(f"Error during torch.onnx.export: {e}")
 
-    print(f"[TensorRT] Przetwarzanie i weryfikacja struktury ONNX...", flush=True)
+    print(f"[TensorRT] Validating and processing ONNX structure...", flush=True)
     os.makedirs(path.parent, exist_ok=True)
     onnx_model = onnx.load(tmp_path, load_external_data=False)
     model_uses_external_data = check_model_uses_external_data(onnx_model)
 
     if model_uses_external_data:
-        print(f"[TensorRT] Model przekracza 2GB (używa zewnętrznych danych wag). Zapisywanie...", flush=True)
+        print(f"[TensorRT] Model exceeds 2GB (using external weight data). Saving...", flush=True)
         tensors_paths = _get_onnx_external_data_tensors(onnx_model)
         onnx_model = onnx.load(tmp_path, load_external_data=True)
         onnx.save(
@@ -293,40 +293,40 @@ def _export_onnx(
 
     if optimizer is not None:
         try:
-            print(f"[TensorRT] Optymalizacja węzłów ONNX (GraphSurgeon)...", flush=True)
+            print(f"[TensorRT] Optimizing ONNX nodes (GraphSurgeon)...", flush=True)
             onnx_opt_graph = optimizer("unet", onnx_model)
             onnx.save(onnx_opt_graph, path)
         except Exception as e:
-            print(f"[TensorRT BŁĄD] Optymalizacja ONNX nie powiodła się: {e}", flush=True)
+            print(f"[TensorRT ERROR] ONNX optimization failed: {e}", flush=True)
             import traceback
             traceback.print_exc()
             if os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise RuntimeError(f"Błąd podczas optymalizacji grafu ONNX: {e}")
+            raise RuntimeError(f"Error during ONNX graph optimization: {e}")
 
     if not model_uses_external_data and optimizer is None:
         shutil.move(tmp_path, str(path))
 
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"[TensorRT] Plik ONNX gotowy pod adresem: {path}", flush=True)
+    print(f"[TensorRT] ONNX model ready at: {path}", flush=True)
 
 
 def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, use_fp16: bool):
-    print(f"[TensorRT] Rozpoczynanie kompilacji silnika TensorRT...", flush=True)
-    print(f"[TensorRT] Wejście ONNX: {onnx_path}", flush=True)
-    print(f"[TensorRT] Wyjście TRT:  {trt_path}", flush=True)
-    print(f"[TensorRT] Pamięć podręczna taktyk (timing cache): {timing_cache}", flush=True)
+    print(f"[TensorRT] Starting TensorRT engine compilation...", flush=True)
+    print(f"[TensorRT] ONNX Input: {onnx_path}", flush=True)
+    print(f"[TensorRT] TRT Output:  {trt_path}", flush=True)
+    print(f"[TensorRT] Timing Cache: {timing_cache}", flush=True)
     engine = Engine(trt_path)
 
     model = None
     if hasattr(shared, "sd_model") and shared.sd_model is not None:
         try:
-            print(f"[TensorRT] Zwalnianie VRAM: przenoszenie modelu bazowego do RAM...", flush=True)
+            print(f"[TensorRT] Freeing VRAM: moving base model to RAM...", flush=True)
             model = shared.sd_model.cpu()
             torch.cuda.empty_cache()
         except Exception as e:
-            print(f"[TensorRT] Uwaga: nie udało się przenieść modelu do CPU: {e}", flush=True)
+            print(f"[TensorRT] Warning: failed to move model to CPU: {e}", flush=True)
 
     try:
         s = time.time()
@@ -339,12 +339,12 @@ def export_trt(trt_path: str, onnx_path: str, timing_cache: str, profile: dict, 
             input_profile=[profile],
         )
         e = time.time()
-        print(f"[TensorRT] Czas kompilacji silnika TensorRT: {(e-s):.2f}s", flush=True)
+        print(f"[TensorRT] TensorRT engine compilation time: {(e-s):.2f}s", flush=True)
         return ret
     finally:
         if model is not None:
             try:
-                print(f"[TensorRT] Przywracanie modelu do pamięci GPU...", flush=True)
+                print(f"[TensorRT] Restoring model to GPU memory...", flush=True)
                 shared.sd_model = model.cuda()
             except Exception as e:
-                print(f"[TensorRT] Uwaga: nie udało się przywrócić modelu do GPU: {e}", flush=True)
+                print(f"[TensorRT] Warning: failed to restore model to GPU: {e}", flush=True)
