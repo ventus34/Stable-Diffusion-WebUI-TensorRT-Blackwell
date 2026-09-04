@@ -114,22 +114,27 @@ def export_unet_to_trt(
         # reForge / Forge / ComfyUI model loader: ensure all weights are loaded on GPU before tracing
         try:
             import ldm_patched.modules.model_management as model_management
-            if hasattr(shared, "sd_model") and shared.sd_model is not None:
-                model_management.load_models_gpu([shared.sd_model])
-        except Exception:
-            pass
+            if hasattr(model_management, "LoadedModel"):
+                orig_del = getattr(model_management.LoadedModel, "__del__", None)
+                if orig_del and not getattr(model_management.LoadedModel, "_del_patched", False):
+                    def safe_del(self):
+                        if getattr(self, "_patcher_finalizer", None) is not None:
+                            try:
+                                self._patcher_finalizer.detach()
+                            except Exception:
+                                pass
+                    model_management.LoadedModel.__del__ = safe_del
+                    model_management.LoadedModel._del_patched = True
 
-        try:
-            if (
-                hasattr(shared, "sd_model")
-                and shared.sd_model is not None
-                and hasattr(shared.sd_model, "forge_objects")
-            ):
-                unet_patcher = shared.sd_model.forge_objects.get("unet", None)
-                if unet_patcher and hasattr(unet_patcher, "load"):
-                    unet_patcher.load()
-        except Exception:
-            pass
+            if hasattr(shared, "sd_model") and shared.sd_model is not None:
+                if hasattr(shared.sd_model, "forge_objects"):
+                    unet_patcher = shared.sd_model.forge_objects.get("unet", None)
+                    if unet_patcher is not None:
+                        model_management.load_models_gpu([unet_patcher], force_full_load=True)
+                        if hasattr(unet_patcher, "load"):
+                            unet_patcher.load()
+        except Exception as e:
+            print(f"[TensorRT] Info: reForge model loader: {e}", flush=True)
 
         try:
             target_device = devices.device if hasattr(devices, "device") else torch.device("cuda")

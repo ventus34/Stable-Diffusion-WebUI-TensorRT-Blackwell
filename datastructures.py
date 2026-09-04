@@ -94,13 +94,29 @@ class ModelConfig:
         if _min_em[1] > max_embedding or _max_em[1] < max_embedding:
             return (False, distance)
 
-        distance = (
-            abs(_opt[0] - batch_size)
+        # 1. Spatial distance: difference between optimal dims and requested dims
+        dist_spatial = (
+            abs(_opt[0] - batch_size) * 10
             + abs(_opt[2] - height)
             + abs(_opt[3] - width)
-            + 0.5 * (abs(_max[2] - height) + abs(_max[3] - width))
+            + 0.25 * (abs(_max[2] - height) + abs(_max[3] - width))
         )
 
+        # 2. Token count distance: difference between optimal token count and prompt tokens
+        dist_token = abs(_opt_em[1] - max_embedding) * 0.1
+
+        # 3. Static shape priority:
+        # If this engine has static shapes and matches requested resolution and batch,
+        # grant a major priority bonus so specialized static engines are preferred over dynamic fallbacks.
+        if self.static_shapes:
+            if _opt[0] == batch_size and _opt[2] == height and _opt[3] == width:
+                dist_static = -1000.0
+            else:
+                dist_static = -100.0
+        else:
+            dist_static = 50.0
+
+        distance = dist_spatial + dist_token + dist_static
         return (True, distance)
 
 
@@ -168,6 +184,15 @@ class ProfileSettings:
             self.h_min = self.h_max = self.h_opt
             self.w_min = self.w_max = self.w_opt
             self.static_shape = True
+        else:
+            self.t_max = max(self.t_max, self.t_opt)
+            self.t_min = min(self.t_min, self.t_opt)
+            self.bs_max = max(self.bs_max, self.bs_opt)
+            self.bs_min = min(self.bs_min, self.bs_opt)
+            self.h_max = max(self.h_max, self.h_opt)
+            self.h_min = min(self.h_min, self.h_opt)
+            self.w_max = max(self.w_max, self.w_opt)
+            self.w_min = min(self.w_min, self.w_opt)
 
     def get_latent_dim(self):
         return (

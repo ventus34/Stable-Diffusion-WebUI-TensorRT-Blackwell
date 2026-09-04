@@ -43,14 +43,79 @@ from scripts.lora import apply_loras
 G_LOGGER.module_severity = G_LOGGER.ERROR
 
 
+def format_profile_summary(config) -> str:
+    try:
+        sample = config.profile.get("sample", None)
+        emb = config.profile.get("encoder_hidden_states", None)
+        if not sample:
+            return "Static" if getattr(config, "static_shapes", False) else "Dynamic"
+        _min, _opt, _max = sample
+        opt_bs = _opt[0] // 2
+        opt_h = _opt[2] * 8
+        opt_w = _opt[3] * 8
+        tok_str = ""
+        if emb and len(emb) > 1 and len(emb[1]) > 1:
+            tok_str = f", tok={emb[1][1]}"
+
+        if getattr(config, "static_shapes", False):
+            return f"{opt_w}x{opt_h} (bs={opt_bs}{tok_str}, Static)"
+        else:
+            min_w, max_w = _min[3] * 8, _max[3] * 8
+            min_h, max_h = _min[2] * 8, _max[2] * 8
+            min_bs, max_bs = _min[0] // 2, _max[0] // 2
+            if min_w == max_w and min_h == max_h and min_bs == max_bs:
+                return f"{opt_w}x{opt_h} (bs={opt_bs}{tok_str}, Static)"
+            if min_w == max_w and min_h == max_h:
+                return f"{opt_w}x{opt_h} (bs={min_bs}-{max_bs}{tok_str}, Dynamic)"
+            return f"{min_w}x{min_h}-{max_w}x{max_h} (opt {opt_w}x{opt_h}, bs={min_bs}-{max_bs}{tok_str}, Dynamic)"
+    except Exception:
+        return "Static" if getattr(config, "static_shapes", False) else "Dynamic"
+
+
+def get_prompt_token_count(prompt: str) -> int:
+    if not prompt or not str(prompt).strip():
+        return 77
+    try:
+        if hasattr(shared, "sd_model") and shared.sd_model is not None:
+            cond_stage = getattr(shared.sd_model, "cond_stage_model", None)
+            if cond_stage and hasattr(cond_stage, "tokenize"):
+                rem = cond_stage.tokenize([prompt])
+                if isinstance(rem, list) and len(rem) > 0:
+                    tok_len = len(rem[0]) if isinstance(rem[0], list) else len(rem)
+                    chunks = max(1, (tok_len + 74) // 75)
+                    return chunks * 77
+    except Exception:
+        pass
+    tokens_approx = len(re.findall(r"\w+|[^\w\s]", str(prompt)))
+    chunks = max(1, (int(tokens_approx * 1.15) + 74) // 75)
+    return chunks * 77
+
+
 class TrtUnetOption(sd_unet.SdUnetOption):
-    def __init__(self, name: str, filename: List[dict]):
-        self.label = f"[TRT] {name}"
+    def __init__(
+        self,
+        name: str,
+        filename: List[dict],
+        forced_profile_idx: int = None,
+        custom_label: str = None,
+    ):
         self.model_name = name
         self.configs = filename
+        self.forced_profile_idx = forced_profile_idx
+        if custom_label:
+            self.label = custom_label
+        elif forced_profile_idx is not None:
+            self.label = f"[TRT] {name} [Profile {forced_profile_idx}]"
+        elif len(filename) > 1:
+            self.label = f"[TRT] {name} (Auto)"
+        else:
+            self.label = f"[TRT] {name}"
 
     def create_unet(self):
-        return TrtUnet(self.model_name, self.configs)
+        unet = TrtUnet(self.model_name, self.configs)
+        if self.forced_profile_idx is not None:
+            unet.profile_idx = self.forced_profile_idx
+        return unet
 
 
 class TrtUnet(sd_unet.SdUnet):
@@ -159,18 +224,25 @@ class TrtUnet(sd_unet.SdUnet):
 
     def switch_engine(self):
         self.loaded_config = self.configs[self.profile_idx]
-        self.engine.reset(os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"]))
+        engine_path = os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
+        print(f"[TensorRT] Switching to Profile {self.profile_idx}: {engine_path}", flush=True)
+        if self.engine is not None:
+            self.engine.reset(engine_path)
+        else:
+            self.engine = Engine(engine_path)
+        self.step_idx = 0
         self.activate()
 
     def activate(self):
         self.loaded_config = self.configs[self.profile_idx]
+        engine_path = os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
         if self.engine is None:
-            self.engine = Engine(
-                os.path.join(TRT_MODEL_DIR, self.loaded_config["filepath"])
-            )
+            self.engine = Engine(engine_path)
+        elif getattr(self.engine, "engine", None) is None:
+            self.engine.engine_path = engine_path
         self.engine.load()
         try:
-            print(f"\nLoaded Profile: {self.profile_idx}")
+            print(f"\n[TensorRT] Loaded Profile: {self.profile_idx}")
             print(self.engine)
         except Exception:
             pass
@@ -258,6 +330,25 @@ class TensorRTScript(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
+    def ui(self, is_img2img):
+        with gr.Accordion("TensorRT Profile", open=False):
+            profile_override = gr.Dropdown(
+                label="Profile Selection Override",
+                choices=[
+                    "Auto (Best Match / SD Unet default)",
+                    "Profile 0",
+                    "Profile 1",
+                    "Profile 2",
+                    "Profile 3",
+                    "Profile 4",
+                    "Profile 5",
+                ],
+                value="Auto (Best Match / SD Unet default)",
+                elem_id=f"trt_profile_override_{'img2img' if is_img2img else 'txt2img'}",
+                info="Force a specific profile index or use Auto to match resolution and batch size.",
+            )
+        return [profile_override]
+
     def setup(self, p, *args):
         return super().setup(p, *args)
 
@@ -283,6 +374,8 @@ class TensorRTScript(scripts.Script):
             hr_scale = 1
         else:
             hr_scale = p.hr_scale if p.enable_hr else 1
+
+        prompt_tokens = get_prompt_token_count(getattr(p, "prompt", ""))
         (
             valid_models,
             distances,
@@ -292,16 +385,40 @@ class TensorRTScript(scripts.Script):
             p.width,
             p.height,
             p.batch_size,
-            77,  # model_type
-        )  # TODO: max_embedding, just ignore?
+            prompt_tokens,
+        )
+        if len(valid_models) == 0 and prompt_tokens != 77:
+            (
+                valid_models,
+                distances,
+                idx,
+            ) = modelmanager.get_valid_models(
+                model_name,
+                p.width,
+                p.height,
+                p.batch_size,
+                77,
+            )
+
         if len(valid_models) == 0:
             gr.Error(
-                f"""No valid profile found for ({model_name}) LOWRES. Please go to the TensorRT tab and generate an engine with the necessary profile. 
-                If using hires.fix, you need an engine for both the base and upscaled resolutions. Otherwise, use the default (torch) U-Net."""
+                f"""No valid profile found for ({model_name}) LOWRES ({p.width}x{p.height}, bs={p.batch_size}). 
+                Please go to the TensorRT tab and generate an engine with the necessary profile, or use PyTorch fallback."""
             )
             return None, None
+
         best = idx[np.argmin(distances)]
         best_hr = best
+
+        print(
+            f"[TensorRT] Candidate profiles for {p.width}x{p.height} bs={p.batch_size} (prompt tokens ~{prompt_tokens}):",
+            flush=True,
+        )
+        for cand_idx, cand_dist in zip(idx, distances):
+            cand_conf = valid_models[idx.index(cand_idx)]["config"]
+            cand_desc = format_profile_summary(cand_conf)
+            is_chosen = " <-- SELECTED" if cand_idx == best else ""
+            print(f"  - Profile {cand_idx} [{cand_desc}]: distance score = {cand_dist:.1f}{is_chosen}", flush=True)
 
         if hr_scale != 1:
             hr_w = int(p.width * p.hr_scale)
@@ -311,12 +428,19 @@ class TensorRTScript(scripts.Script):
                 hr_w,
                 hr_h,
                 p.batch_size,
-                77,  # model_type
-            )  # TODO: max_embedding
+                prompt_tokens,
+            )
+            if len(valid_models_hr) == 0 and prompt_tokens != 77:
+                valid_models_hr, distances_hr, idx_hr = modelmanager.get_valid_models(
+                    model_name,
+                    hr_w,
+                    hr_h,
+                    p.batch_size,
+                    77,
+                )
             if len(valid_models_hr) == 0:
                 gr.Error(
-                    f"""No valid profile found for ({model_name}) HIRES. Please go to the TensorRT tab and generate an engine with the necessary profile. 
-                    If using hires.fix, you need an engine for both the base and upscaled resolutions. Otherwise, use the default (torch) U-Net."""
+                    f"""No valid profile found for ({model_name}) HIRES ({hr_w}x{hr_h}). Please generate an engine for the upscaled resolution."""
                 )
             merged_idx = [i for i, id in enumerate(idx) if id in idx_hr]
             if len(merged_idx) == 0:
@@ -389,9 +513,18 @@ class TensorRTScript(scripts.Script):
                 getattr(shared, "sd_model", None), "sd_checkpoint_info", None
             )
             model_name = getattr(model_name, "model_name", str(model_name))
-            if model_name in avail:
+            
+            for opt in getattr(sd_unet, "unet_options", []):
+                if getattr(opt, "model_name", None) == model_name:
+                    sd_unet_option = opt
+                    break
+
+            if sd_unet_option is None and model_name in avail:
                 sd_unet.list_unets()
-                sd_unet_option = sd_unet.get_unet_option()
+                for opt in getattr(sd_unet, "unet_options", []):
+                    if getattr(opt, "model_name", None) == model_name:
+                        sd_unet_option = opt
+                        break
                 if sd_unet_option is None:
                     sd_unet_option = TrtUnetOption(model_name, avail[model_name])
             if sd_unet_option is None:
@@ -404,7 +537,34 @@ class TensorRTScript(scripts.Script):
                     p.sd_model_name, sd_unet_option.model_name
                 )
             )
-        self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET)
+
+        # Check for UI override from accordion dropdown
+        profile_override = None
+        if len(args) > 0 and isinstance(args[0], str):
+            val = args[0].strip()
+            if val.startswith("Profile "):
+                try:
+                    profile_override = int(val.split()[1])
+                except Exception:
+                    profile_override = None
+
+        if profile_override is not None:
+            self.idx = profile_override
+            self.hr_idx = profile_override
+            print(f"[TensorRT] UI override: forced Profile {self.idx}", flush=True)
+        elif getattr(sd_unet_option, "forced_profile_idx", None) is not None:
+            self.idx = sd_unet_option.forced_profile_idx
+            self.hr_idx = sd_unet_option.forced_profile_idx
+            print(f"[TensorRT] SD Unet option: forced Profile {self.idx}", flush=True)
+        else:
+            self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET)
+            print(f"[TensorRT] Selected Profile: {self.idx} (HR: {self.hr_idx})", flush=True)
+
+        num_profiles = len(sd_unet_option.configs) if hasattr(sd_unet_option, "configs") else 0
+        if self.idx is not None and num_profiles > 0 and self.idx >= num_profiles:
+            gr.Warning(f"[TensorRT] Selected Profile {self.idx} is out of range ({num_profiles} available). Reverting to Auto.")
+            self.idx, self.hr_idx = self.get_profile_idx(p, p.sd_model_name, ModelType.UNET)
+
         self.torch_unet = self.idx is None or self.hr_idx is None
 
         try:
@@ -424,6 +584,13 @@ class TensorRTScript(scripts.Script):
             and sd_unet.current_unet is not None
             and not self.torch_unet
         ):
+            if self.idx is not None and sd_unet.current_unet.profile_idx != self.idx:
+                print(
+                    f"[TensorRT] Switching active engine from Profile {sd_unet.current_unet.profile_idx} to Profile {self.idx}",
+                    flush=True,
+                )
+                sd_unet.current_unet.profile_idx = self.idx
+                sd_unet.current_unet.switch_engine()
             return
 
         if sd_unet.current_unet is not None:
@@ -451,7 +618,7 @@ class TensorRTScript(scripts.Script):
         sd_unet.current_unet.option = sd_unet_option
         sd_unet.current_unet_option = sd_unet_option
 
-        print(f"Activating unet: {sd_unet.current_unet.option.label}")
+        print(f"Activating unet: {sd_unet.current_unet.option.label} (Profile {self.idx})", flush=True)
         sd_unet.current_unet.activate()
 
     def process_batch(self, p, *args, **kwargs):
@@ -459,12 +626,18 @@ class TensorRTScript(scripts.Script):
         if self.torch_unet:
             return super().process_batch(p, *args, **kwargs)
 
-        if sd_unet.current_unet is not None and self.idx != sd_unet.current_unet.profile_idx:
+        if sd_unet.current_unet is not None and self.idx is not None and self.idx != sd_unet.current_unet.profile_idx:
+            print(f"[TensorRT] process_batch: switching to Profile {self.idx}", flush=True)
             sd_unet.current_unet.profile_idx = self.idx
             sd_unet.current_unet.switch_engine()
 
     def before_hr(self, p, *args):
-        if self.idx != self.hr_idx:
+        if (
+            sd_unet.current_unet is not None
+            and self.hr_idx is not None
+            and sd_unet.current_unet.profile_idx != self.hr_idx
+        ):
+            print(f"[TensorRT] HR Fix: switching to Profile {self.hr_idx}", flush=True)
             sd_unet.current_unet.profile_idx = self.hr_idx
             sd_unet.current_unet.switch_engine()
 
@@ -479,10 +652,33 @@ class TensorRTScript(scripts.Script):
 def list_unets(l):
     model = modelmanager.available_models()
     for k, v in model.items():
-        if v[0]["config"].lora:
+        if not v or v[0]["config"].lora:
             continue
-        label = "{} ({})".format(k, v[0]["base_model"]) if v[0]["config"].lora else k
-        l.append(TrtUnetOption(label, v))
+        base_label = "{} ({})".format(k, v[0]["base_model"]) if v[0]["config"].lora else k
+
+        # Always provide base/auto option
+        auto_label = f"[TRT] {base_label} (Auto)" if len(v) > 1 else f"[TRT] {base_label}"
+        l.append(
+            TrtUnetOption(
+                name=base_label,
+                filename=v,
+                forced_profile_idx=None,
+                custom_label=auto_label,
+            )
+        )
+        # If multiple profiles exist, also expose each profile individually in the dropdown
+        if len(v) > 1:
+            for idx, conf in enumerate(v):
+                summary = format_profile_summary(conf.get("config", None))
+                profile_label = f"[TRT] {base_label} [Profile {idx}: {summary}]"
+                l.append(
+                    TrtUnetOption(
+                        name=base_label,
+                        filename=v,
+                        forced_profile_idx=idx,
+                        custom_label=profile_label,
+                    )
+                )
 
 
 patch_unet_forward()
