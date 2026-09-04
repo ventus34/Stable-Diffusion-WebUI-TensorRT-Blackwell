@@ -176,6 +176,7 @@ class Engine:
 
         self.buffers = OrderedDict()
         self.tensors = OrderedDict()
+        self.is_reusing_device_memory = False
         self.inputs = {}
         self.outputs = {}
 
@@ -337,9 +338,11 @@ class Engine:
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
 
     def activate(self, reuse_device_memory=False):
+        self.is_reusing_device_memory = False
         if reuse_device_memory and hasattr(self.engine, "create_execution_context_without_device_memory"):
             try:
                 self.context = self.engine.create_execution_context_without_device_memory()
+                self.is_reusing_device_memory = True
                 return
             except Exception:
                 pass

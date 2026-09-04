@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 from typing import List
 
@@ -68,27 +69,65 @@ class TrtUnet(sd_unet.SdUnet):
 
         self.engine = None
         self.device_memory_buffer = None
+        self.step_idx = 0
 
     def forward(
         self,
         x: torch.Tensor,
-        timesteps: torch.Tensor,
-        context: torch.Tensor,
+        timesteps: torch.Tensor = None,
+        context: torch.Tensor = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         nvtx.range_push("forward")
+
+        self.step_idx = getattr(self, "step_idx", 0) + 1
+        if self.step_idx == 1:
+            print(f"[TensorRT] Step 1: Executing accelerated TensorRT inference on Blackwell engine...", flush=True)
+
+        if timesteps is None and "timesteps" in kwargs:
+            timesteps = kwargs["timesteps"]
+        if context is None:
+            if "context" in kwargs:
+                context = kwargs["context"]
+            elif "encoder_hidden_states" in kwargs:
+                context = kwargs["encoder_hidden_states"]
+
+        b = x.shape[0]
+        if timesteps is not None:
+            if timesteps.dim() == 0:
+                timesteps = timesteps.unsqueeze(0).repeat(b)
+            elif timesteps.shape[0] == 1 and b > 1:
+                timesteps = timesteps.repeat(b)
+            elif timesteps.shape[0] != b:
+                timesteps = timesteps.expand(b)
+
+        if context is not None and context.shape[0] == 1 and b > 1:
+            context = context.repeat(b, 1, 1)
+
         feed_dict = {
             "sample": x,
             "timesteps": timesteps,
             "encoder_hidden_states": context,
         }
-        if "y" in kwargs and kwargs["y"] is not None:
-            feed_dict["y"] = kwargs["y"]
-        elif len(args) > 0 and args[0] is not None:
-            feed_dict["y"] = args[0]
 
-        if self.engine_vram_req > 0 and hasattr(self.engine.context, "device_memory"):
+        y = kwargs.get("y", None)
+        if y is None and len(args) > 0 and args[0] is not None:
+            y = args[0]
+        if y is not None:
+            if y.shape[0] == 1 and b > 1:
+                y = y.repeat(b, 1)
+            feed_dict["y"] = y
+
+        for k, v in list(feed_dict.items()):
+            if isinstance(v, torch.Tensor) and v.device.type != "cuda":
+                feed_dict[k] = v.to(device=devices.device)
+
+        if (
+            getattr(self.engine, "is_reusing_device_memory", False)
+            and self.engine_vram_req > 0
+            and hasattr(self.engine.context, "device_memory")
+        ):
             try:
                 if (
                     self.device_memory_buffer is None
@@ -107,7 +146,7 @@ class TrtUnet(sd_unet.SdUnet):
         out = self.engine.infer(feed_dict, self.cudaStream)["latent"]
 
         nvtx.range_pop()
-        return out
+        return out.clone()
 
     def apply_loras(self, refit_dict: dict):
         if not self.refitted_keys.issubset(set(refit_dict.keys())):
@@ -140,7 +179,7 @@ class TrtUnet(sd_unet.SdUnet):
             "device_memory_size_v2",
             getattr(self.engine.engine, "device_memory_size", 0),
         )
-        self.engine.activate(reuse_device_memory=(self.engine_vram_req > 0))
+        self.engine.activate(reuse_device_memory=False)
 
     def deactivate(self):
         try:
@@ -156,6 +195,51 @@ class TrtUnet(sd_unet.SdUnet):
         self.device_memory_buffer = None
         del self.engine
         self.engine = None
+
+
+_patched_unet_classes = set()
+
+
+def patch_unet_forward():
+    """
+    Hooks UNetModel.forward in ldm_patched, ldm, and sgm to redirect to sd_unet.current_unet when active.
+    This is required for Stable Diffusion WebUI reForge (and Forge), which uses ldm_patched as its
+    execution backend and does not have the classic A1111 sd_hijack unet forward patch enabled.
+    """
+    targets = [
+        ("ldm_patched.ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
+        ("ldm.modules.diffusionmodules.openaimodel", "UNetModel"),
+        ("sgm.modules.diffusionmodules.openaimodel", "UNetModel"),
+    ]
+
+    for mod_name, cls_name in targets:
+        try:
+            import importlib
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                try:
+                    mod = importlib.import_module(mod_name)
+                except Exception:
+                    continue
+            cls = getattr(mod, cls_name, None)
+            if cls is None or getattr(cls, "_trt_patched", False):
+                continue
+
+            orig_forward = cls.forward
+
+            def make_replacement(original_fn, module_label):
+                def unet_forward(self, x, timesteps=None, context=None, *args, **kwargs):
+                    if sd_unet.current_unet is not None:
+                        return sd_unet.current_unet.forward(x, timesteps, context, *args, **kwargs)
+                    return original_fn(self, x, timesteps, context, *args, **kwargs)
+                return unet_forward
+
+            cls._orig_trt_forward = orig_forward
+            cls.forward = make_replacement(orig_forward, mod_name)
+            cls._trt_patched = True
+            print(f"[TensorRT] Successfully hijacked {mod_name}.{cls_name}.forward -> sd_unet.current_unet", flush=True)
+        except Exception:
+            pass
 
 
 class TensorRTScript(scripts.Script):
@@ -294,10 +378,24 @@ class TensorRTScript(scripts.Script):
         self.lora_refit_dict = refit_dict
 
     def process(self, p, *args):
+        patch_unet_forward()
+
         # before unet_init
         sd_unet_option = sd_unet.get_unet_option()
         if sd_unet_option is None:
-            return
+            # Try auto-detecting matching engine if unet_options was not yet populated or set to None
+            avail = modelmanager.available_models()
+            model_name = getattr(p, "sd_model_name", None) or getattr(
+                getattr(shared, "sd_model", None), "sd_checkpoint_info", None
+            )
+            model_name = getattr(model_name, "model_name", str(model_name))
+            if model_name in avail:
+                sd_unet.list_unets()
+                sd_unet_option = sd_unet.get_unet_option()
+                if sd_unet_option is None:
+                    sd_unet_option = TrtUnetOption(model_name, avail[model_name])
+            if sd_unet_option is None:
+                return
 
         if not sd_unet_option.model_name == p.sd_model_name:
             gr.Error(
@@ -317,6 +415,8 @@ class TensorRTScript(scripts.Script):
             raise e
 
         self.apply_unet(sd_unet_option)
+        if sd_unet.current_unet is not None:
+            sd_unet.current_unet.step_idx = 0
 
     def apply_unet(self, sd_unet_option):
         if (
@@ -333,11 +433,17 @@ class TensorRTScript(scripts.Script):
             gr.Warning("Enabling PyTorch fallback as no engine was found.")
             sd_unet.current_unet = None
             sd_unet.current_unet_option = sd_unet_option
-            shared.sd_model.model.diffusion_model.to(devices.device)
+            try:
+                shared.sd_model.model.diffusion_model.to(devices.device)
+            except Exception:
+                pass
             return
         else:
-            shared.sd_model.model.diffusion_model.to(devices.cpu)
-            devices.torch_gc()
+            try:
+                shared.sd_model.model.diffusion_model.to(devices.cpu)
+                devices.torch_gc()
+            except Exception:
+                pass
             if self.lora_refit_dict:
                 self.update_lora = True
         sd_unet.current_unet = sd_unet_option.create_unet()
@@ -379,5 +485,6 @@ def list_unets(l):
         l.append(TrtUnetOption(label, v))
 
 
+patch_unet_forward()
 script_callbacks.on_list_unets(list_unets)
 script_callbacks.on_ui_tabs(ui_trt.on_ui_tabs)
